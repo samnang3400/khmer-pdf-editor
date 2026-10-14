@@ -127,10 +127,6 @@ def default_font() -> KhmerFont:
 # --------------------------------------------------------------------------
 # PDF writing
 # --------------------------------------------------------------------------
-def _utf16_hex(s: str) -> str:
-    return "FEFF" + s.encode("utf-16-be").hex().upper()
-
-
 # Uniform advance (1/1000 em) for the invisible text font. Kept small so the
 # per-character horizontal scaling (Tz) is almost always >= 100%: MuPDF reports
 # span size as font size x min(1, Tz), so this keeps one consistent size per line.

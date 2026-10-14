@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDialog,
                                QVBoxLayout, QWidget)
 
 from . import __version__
-from .engine import (FONT_DIR, TextLine, bundled_fonts, insert_khmer_text, load_font,
+from .engine import (TextLine, bundled_fonts, insert_khmer_text, load_font,
                      replace_text, system_khmer_fonts, text_lines)
 
 APP_NAME = "KhmerPDF Editor"
