@@ -1,0 +1,111 @@
+import subprocess
+import shutil
+
+import pymupdf
+import pytest
+
+from khmerpdf.engine import insert_khmer_text, replace_text, text_lines, default_font
+from khmerpdf.linebreak import syllables, wrap
+
+SAMPLES = ["ស្ត្រី", "រៀន", "ទាំង", "ព្រះរាជាណាចក្រកម្ពុជា", "ត្រូវ", "សិស្សានុសិស្ស", "ក្ស្ម"]
+
+
+def _doc_with(text, **kw):
+    doc = pymupdf.open()
+    page = doc.new_page()
+    insert_khmer_text(page, pymupdf.Rect(40, 40, 560, 400), text, **kw)
+    return pymupdf.open(stream=doc.tobytes())
+
+
+@pytest.mark.parametrize("word", SAMPLES)
+def test_roundtrip_mupdf(word):
+    page = _doc_with(word, size=16)[0]
+    assert page.get_text().strip() == word
+    assert page.search_for(word), "search must find shaped Khmer"
+
+
+@pytest.mark.skipif(not shutil.which("pdftotext"), reason="poppler not installed")
+def test_roundtrip_poppler(tmp_path):
+    text = " ".join(SAMPLES)
+    fn = tmp_path / "p.pdf"
+    _doc_with(text, size=14).save(fn)
+    out = subprocess.run(["pdftotext", str(fn), "-"], capture_output=True, text=True).stdout
+    assert "".join(out.split()) == "".join(text.split())
+
+
+def test_mixed_latin_and_wrap():
+    text = "សិស្សទាំងអស់ត្រូវមកសាលារៀន Footprints School " * 4
+    page = _doc_with(text, size=12)[0]
+    got = "".join(page.get_text().split())
+    assert got == "".join(text.split())
+
+
+def test_syllables_keep_subscripts():
+    assert syllables("ស្ត្រី") == ["ស្ត្រី"]
+    assert syllables("សាលារៀន") == ["សា", "លា", "រៀ", "ន"]
+
+
+def test_wrap_never_exceeds_width():
+    f = default_font()
+    text = "ព្រះរាជាណាចក្រកម្ពុជាជាតិសាសនាព្រះមហាក្សត្រ" * 3
+    lines = wrap(text, 150, lambda s: f.width(s, 12))
+    assert "".join(lines) == text
+    assert all(f.width(line, 12) <= 150 for line in lines)
+
+
+def test_replace_existing_line():
+    doc = _doc_with("សួស្តី Hello", size=14)
+    page = doc[0]
+    line = text_lines(page)[0]
+    replace_text(page, line, "ជម្រាបសួរ")
+    page = pymupdf.open(stream=doc.tobytes())[0]
+    assert page.get_text().strip() == "ជម្រាបសួរ"
+
+
+def test_multiple_pages_share_one_font_file():
+    doc = pymupdf.open()
+    for i in range(3):
+        page = doc.new_page()
+        insert_khmer_text(page, pymupdf.Rect(40, 40, 500, 200), f"ទំព័រទី {i + 1} ស្ត្រី")
+        insert_khmer_text(page, pymupdf.Rect(40, 300, 500, 400), "សិស្សានុសិស្ស")
+    doc = pymupdf.open(stream=doc.tobytes(garbage=3))
+    embedded = sum("/FontFile2" in doc.xref_object(x) for x in range(1, doc.xref_length()))
+    assert embedded == 2  # Battambang + the tiny glyph-less font, shared by all pages
+    for i, page in enumerate(doc):
+        assert page.search_for(f"ទំព័រទី {i + 1}") and page.search_for("សិស្សានុសិស្ស")
+
+
+def test_rotated_page():
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.set_rotation(90)
+    insert_khmer_text(page, pymupdf.Rect(40, 40, 500, 200), "ព្រះរាជាណាចក្រកម្ពុជា")
+    page = pymupdf.open(stream=doc.tobytes())[0]
+    assert page.rotation == 90
+    assert page.get_text().strip() == "ព្រះរាជាណាចក្រកម្ពុជា"
+
+
+def test_edit_pdf_with_broken_khmer_text_layer():
+    """A PDF from another tool (MuPDF's HTML writer) whose Khmer extracts as junk."""
+    from khmerpdf.engine import FONT_DIR
+    doc = pymupdf.open()
+    page = doc.new_page()
+    css = "@font-face{font-family:K;src:url(Battambang-Regular.ttf);} body{font-family:K;font-size:14px}"
+    page.insert_htmlbox(pymupdf.Rect(40, 40, 500, 100), "សាលាអន្តរជាតិ", css=css,
+                        archive=pymupdf.Archive(str(FONT_DIR)))
+    page = pymupdf.open(stream=doc.tobytes())
+    line = text_lines(page[0])[0]
+    assert line.text != "សាលាអន្តរជាតិ"  # the original text layer is broken
+    replace_text(page[0], line, "សាលាអន្តរជាតិ ហ្វតព្រីនស៍")
+    assert pymupdf.open(stream=page.tobytes())[0].get_text().strip() == "សាលាអន្តរជាតិ ហ្វតព្រីនស៍"
+
+
+@pytest.mark.parametrize("size", [9, 12, 18, 30])
+def test_detected_size_matches(size):
+    doc = pymupdf.open()
+    page = doc.new_page()
+    insert_khmer_text(page, pymupdf.Rect(40, 40, 560, 200), "សួស្តី ពិភពលោក Hello", size=size)
+    page.insert_text((40, 400), "Plain Latin text", fontsize=size)
+    page = pymupdf.open(stream=doc.tobytes())[0]
+    sizes = [ln.size for ln in text_lines(page)]
+    assert len(sizes) == 2 and all(abs(s - size) <= 0.5 for s in sizes), sizes

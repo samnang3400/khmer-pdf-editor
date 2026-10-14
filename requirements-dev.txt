@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest
+pyinstaller
+fonttools  # only for tools/make_glyphless_font.py
