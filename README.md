@@ -8,11 +8,15 @@ when they write it. This one shapes Khmer correctly and keeps the text searchabl
 | Problem | Typical editors | KhmerPDF |
 |---|---|---|
 | **Shaping**: subscript consonants (`្ត`), pre-base vowels (`េ ែ ៃ`), the coeng sign | Place characters one by one: visible `្`, broken stacks | Shapes every line with **HarfBuzz** before writing |
-| **Text layer**: shaped glyphs have no 1:1 Unicode value | Copy/search gives junk like `ĮĦអនÌរ` | Visible glyphs carry no text. An **invisible Unicode layer** (on a glyph-less font, like OCR'd PDFs) holds the real text |
+| **Text layer**: shaped glyphs have no 1:1 Unicode value | Copy/search gives junk like `ĮĦអនÌរ` | Visible glyphs are drawn as **vector outlines** (not text). An **invisible Unicode layer** in a glyph-less font, the way OCR'd PDFs work, holds the real text |
 | **Line wrapping**: Khmer has no spaces between words | Wraps only at spaces, or mid-character | Wraps at spaces and zero-width spaces (ZWSP), with orthographic-syllable fallback |
 | **Editing existing Khmer** | Often impossible | Click a line → it is redacted and rewritten on the same baseline. Detects PDFs whose Khmer text layer is broken |
 
-Copy, search and extraction are tested against both **MuPDF** and **Poppler** (`tests/`).
+Copy, search and extraction are tested in the engines behind the viewers people actually use (`tests/`):
+**MuPDF** (this app), **PDFium** (Chrome/Edge), **pdf.js** (Firefox) and **Poppler/xpdf**.
+The pdf.js test runs when `PDFJS_DIR` points to a folder containing `node_modules/pdfjs-dist`.
+
+Lines written by the app also store their own text, font, size and colour, so editing them is exact.
 
 ## Features (v0.1)
 
@@ -65,6 +69,8 @@ and optionally adds KhmerPDF to *Open with* for PDFs without changing the defaul
   Limon (legacy) → Unicode conversion
 - **Phase 3:** page operations (merge, split, rotate, reorder), form filling, signatures, annotations
 - Rotated pages are supported for adding text, but less tested than upright pages
+- Editing a line the app wrote edits that line only (a wrapped paragraph doesn't reflow yet)
+- Search highlights are spread evenly across a line, so they can be slightly offset within long lines
 - Unsigned installer: Windows SmartScreen will warn until the app is code-signed
 
 ## Licensing note

@@ -2,3 +2,4 @@
 pytest
 pyinstaller
 fonttools  # only for tools/make_glyphless_font.py
+pypdfium2  # text-layer test for Chrome/Edge (PDFium)

@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDialog,
 
 from . import __version__
 from .engine import (TextLine, bundled_fonts, insert_khmer_text, load_font,
-                     replace_text, system_khmer_fonts, text_lines)
+                     replace_text, search, system_khmer_fonts, text_lines)
 
 APP_NAME = "KhmerPDF Editor"
 SCREEN_DPI = 96
@@ -484,7 +484,8 @@ class MainWindow(QMainWindow):
     def edit_line(self, line: TextLine):
         c = QColor.fromRgbF(*line.color)
         dlg = TextDialog(self, self.fonts, title="Edit text", text="" if line.garbled else line.text,
-                         font=self.cur_font, size=line.size, color=c, show_align=False, original=line)
+                         font=line.font if line.font in self.fonts.paths else self.cur_font,
+                         size=line.size, color=c, show_align=False, original=line)
         if dlg.exec() != QDialog.Accepted:
             return
         v = dlg.values()
@@ -535,7 +536,7 @@ class MainWindow(QMainWindow):
             self.search_hits = []
             self.render()
             return
-        self.search_hits = [(i, r) for i in range(self.doc.page_count) for r in self.doc[i].search_for(q)]
+        self.search_hits = [(i, r) for i in range(self.doc.page_count) for r in search(self.doc[i], q)]
         if not self.search_hits:
             self.statusBar().showMessage(f"“{q}” not found")
             self.render()
