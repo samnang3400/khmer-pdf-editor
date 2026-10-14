@@ -48,3 +48,91 @@ def test_canonical_spelling_preferred():
 ])
 def test_looks_broken(text, broken):
     assert looks_broken(text) is broken
+
+
+def _renumber_glyphs(doc):
+    """Re-embed each Khmer font as a subset with NEW glyph IDs (as LibreOffice,
+    browsers and others do) and add a CIDToGIDMap so the page still renders."""
+    import io
+    from fontTools import subset
+    from fontTools.ttLib import TTFont
+    for xref in range(1, doc.xref_length()):
+        if "/CIDFontType2" not in doc.xref_object(xref):
+            continue
+        desc = int(doc.xref_get_key(xref, "FontDescriptor")[1].split()[0])
+        ff = int(doc.xref_get_key(desc, "FontFile2")[1].split()[0])
+        font = TTFont(io.BytesIO(doc.xref_stream(ff)))
+        order = font.getGlyphOrder()
+        used = sorted({c[1] for page in doc for sp in page.get_texttrace() for c in sp["chars"] if c[1] > 0})
+        opts = subset.Options()
+        opts.retain_gids = False
+        opts.notdef_outline = True
+        opts.layout_features = []
+        sub = subset.Subsetter(opts)
+        sub.populate(glyphs=[order[g] for g in used])
+        sub.subset(font)
+        new_ids = {name: i for i, name in enumerate(font.getGlyphOrder())}
+        out = io.BytesIO()
+        font.save(out)
+        doc.update_stream(ff, out.getvalue())
+        c2g = bytearray(2 * (max(used) + 1))
+        for g in used:
+            n = new_ids[order[g]]
+            c2g[2 * g:2 * g + 2] = n.to_bytes(2, "big")
+        m = doc.get_new_xref()
+        doc.update_object(m, "<<>>")
+        doc.update_stream(m, bytes(c2g))
+        doc.xref_set_key(xref, "CIDToGIDMap", f"{m} 0 R")
+    return pymupdf.open(stream=doc.tobytes())
+
+
+@pytest.mark.parametrize("font_file", ["KhmerOSsiemreap.ttf", "KhmerOScontent.ttf"])
+def test_recovers_renamed_and_renumbered_fonts(font_file):
+    """Fonts are found by glyph outlines, not names or glyph IDs."""
+    doc = _broken_pdf(font_file)
+    for xref in range(1, doc.xref_length()):  # rename the font, like some PDF writers do
+        if doc.xref_get_key(xref, "BaseFont")[0] == "name":
+            doc.xref_set_key(xref, "BaseFont", "/ABCDEF+F1")
+    doc = _renumber_glyphs(pymupdf.open(stream=doc.tobytes()))
+    page = doc[0]
+    gids = {c[1] for sp in page.get_texttrace() for c in sp["chars"]}
+    assert max(gids) < 120  # the glyph IDs really were renumbered
+    assert [ln.text for ln in text_lines(page)] == LINES
+
+
+def test_tolerates_glyph_order_differences():
+    """Word (Uniscribe) can order a syllable's marks differently from HarfBuzz;
+    that used to leave a stray ្ in the text."""
+    dec = decoder(str(KHMER_OS / "KhmerOSbattambang.ttf"))
+    for word in ("ង្ចា", "ស្ត្រី", "ព្រះ", "ក្រុង", "ឡើង"):
+        g = list(dec._shape(word))
+        marks = [i for i in range(len(g) - 1) if g[i] not in dec.bases and g[i + 1] not in dec.bases]
+        for i in marks:
+            perm = g[:]
+            perm[i], perm[i + 1] = perm[i + 1], perm[i]
+            ctx = list(dec._shape("ការ")) + perm + list(dec._shape("នេះ"))
+            assert dec.decode([(x, "") for x in ctx]) == "ការ" + word + "នេះ", (word, i)
+
+
+def test_unknown_font_gets_best_effort_text_not_an_empty_box(monkeypatch):
+    """Without a matching font, the line is rebuilt with Khmer rules (marked
+    approximate) instead of being offered as 'type the replacement'."""
+    import khmerpdf.recover as R
+    monkeypatch.setattr(R, "page_decoders", lambda page: {})
+    page = _broken_pdf()[0]
+    lines = text_lines(page)
+    assert lines and all(ln.approx and not ln.garbled for ln in lines)
+    # this PDF maps its subscripts to U+FFFD, so those are lost, but the
+    # syllable order is right (no "សចេ" / stray ្)
+    assert lines[0].text.startswith("សេចក") and "\u17d2" not in lines[0].text[:2]
+
+
+def test_repair_visual_order_rules():
+    from khmerpdf.recover import repair_visual_order
+    # (x, y, bbox, gid, text, size): base glyphs 6 wide, subscripts 0 wide
+    def g(t, w=6.0):
+        return (0, 0, (0, 0, w, 10), 1, t, 12)
+    assert repair_visual_order([g("េ"), g("ស"), g("ច"), g("ក"), g("ត", 0), g("ី", 0)]) == "សេចក្តី"
+    assert repair_visual_order([g("្", 4), g("ក"), g("ម")]) == "ក្រម"     # pre-base ro
+    assert repair_visual_order([g("េ"), g("ល"), g("ា")]) == "លោ"           # split vowel
+    assert repair_visual_order([g("ǒ"), g("ថ"), g("ប"), g("័", 0), g("ន")]) == "ថប័ន"  # junk dropped

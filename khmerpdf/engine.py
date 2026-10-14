@@ -67,14 +67,24 @@ class KhmerFont:
         return self.path.stem.replace("-", " ")
 
     def shape(self, text: str) -> list[Glyph]:
-        buf = hb.Buffer()
-        buf.add_str(text)
-        buf.guess_segment_properties()
-        hb.shape(self.hb_font, buf, {"kern": True, "liga": True})
-        return [
-            Glyph(i.codepoint, i.cluster, p.x_advance, p.x_offset, p.y_offset)
-            for i, p in zip(buf.glyph_infos, buf.glyph_positions)
-        ]
+        """Shape a line. Khmer and non-Khmer runs are shaped separately with
+        explicit scripts: HarfBuzz guesses ONE script per buffer from the
+        first letter, so a line starting with an English word would otherwise
+        get no Khmer shaping (broken subscripts). Clusters index into `text`."""
+        if not text:
+            return []
+        cps = [ord(c) for c in text]
+        out: list[Glyph] = []
+        for start, end, khmer in _script_runs(text):
+            buf = hb.Buffer()
+            buf.add_codepoints(cps, start, end - start)  # whole line as context
+            buf.direction = "ltr"
+            buf.script = "Khmr" if khmer else "Latn"
+            buf.language = "km" if khmer else "en"
+            hb.shape(self.hb_font, buf, {"kern": True, "liga": True})
+            out += [Glyph(i.codepoint, i.cluster, p.x_advance, p.x_offset, p.y_offset)
+                    for i, p in zip(buf.glyph_infos, buf.glyph_positions)]
+        return out
 
     def width(self, text: str, size: float) -> float:
         return sum(g.x_advance for g in self.shape(text)) * size / self.upem
@@ -84,6 +94,30 @@ class KhmerFont:
 
     def ascent(self, size: float) -> float:
         return self.ascender * size / self.upem
+
+
+def _is_khmer(ch: str) -> bool:
+    return "\u1780" <= ch <= "\u17ff" or "\u19e0" <= ch <= "\u19ff"
+
+
+_NEUTRAL = set(" \t\xa0\u200b\u200c\u200d\u2060\ufeff.,;:!?()[]{}\"'«»-–—/\\%0123456789")
+
+
+def _script_runs(text: str) -> list[tuple[int, int, bool]]:
+    """(start, end, is_khmer) runs. Spaces, digits and punctuation join the
+    run they follow (or the next one at the start of the line)."""
+    runs: list[list] = []
+    for i, ch in enumerate(text):
+        k = None if ch in _NEUTRAL else _is_khmer(ch)
+        if not runs:
+            runs.append([i, i + 1, k])
+        elif k is None or runs[-1][2] is None or k == runs[-1][2]:
+            runs[-1][1] = i + 1
+            if runs[-1][2] is None:
+                runs[-1][2] = k
+        else:
+            runs.append([i, i + 1, k])
+    return [(a, b, bool(k)) for a, b, k in runs]
 
 
 @lru_cache(maxsize=None)
@@ -321,27 +355,57 @@ def layout(text: str, font: KhmerFont, size: float, width: float | None) -> list
     return wrap(text, width, lambda s: font.width(s, size))
 
 
+FIT_RANGE = 0.15     # fit an edited line to the original width if within ±15%
+MAX_SQUEEZE = 0.08   # ...using at most ±8% horizontal scaling (beyond word spacing)
+
+
+def _fit_plan(glyphs: list[Glyph], text: str, scale: float, natural: float,
+              target: float | None) -> tuple[float, dict[int, float]]:
+    """How to make a line exactly `target` wide, like the justified line it
+    replaces: (horizontal scale, extra advance per space glyph index).
+    Word spacing changes first (spaces can shrink to 30%); a small horizontal
+    scale takes up the rest. No fitting when the text changed length a lot."""
+    if not target or natural <= 0 or abs(target - natural) / target > FIT_RANGE:
+        return 1.0, {}
+    spaces = [i for i, g in enumerate(glyphs) if text[g.cluster:g.cluster + 1] in (" ", "\xa0")]
+    extra = target - natural
+    per_space: dict[int, float] = {}
+    if spaces:
+        each = extra / len(spaces)
+        min_each = -0.7 * min(glyphs[i].x_advance for i in spaces) * scale
+        each = max(each, min_each)
+        per_space = {i: each for i in spaces}
+        extra -= each * len(spaces)
+    sx = target / (target - extra) if extra else 1.0
+    sx = min(max(sx, 1 - MAX_SQUEEZE), 1 + MAX_SQUEEZE)
+    return sx, per_space
+
+
 def _write_line(page: pymupdf.Page, font: KhmerFont, text: str, x: float, baseline: float,
-                size: float, color: tuple[float, float, float], to_pdf: pymupdf.Matrix) -> pymupdf.Rect:
+                size: float, color: tuple[float, float, float], to_pdf: pymupdf.Matrix,
+                fit_width: float | None = None) -> pymupdf.Rect:
     """Write one shaped line as its own Form XObject. (x, baseline) are MuPDF
-    (top-left origin) coordinates on the unrotated page."""
+    (top-left origin) coordinates on the unrotated page. With `fit_width`,
+    the line is stretched/squeezed to that width (see _fit_plan)."""
     doc = page.parent
     glyphs = font.shape(text)
     scale = size / font.upem
     glyph_res: dict[str, int] = {}
     ops = ["q", f"{color[0]:.3f} {color[1]:.3f} {color[2]:.3f} rg"]
+    natural = sum(g.x_advance for g in glyphs) * scale
+    sx, per_space = _fit_plan(glyphs, text, scale, natural, fit_width)
 
     # 1. visible glyph outlines
-    pen = 0
-    for g in glyphs:
-        gx = glyph = _glyph_xobject(doc, font, g.gid)
+    pen = 0.0  # in points, already including spacing adjustments
+    for i, g in enumerate(glyphs):
+        glyph = _glyph_xobject(doc, font, g.gid)
         if glyph:
             name, gx = glyph
             glyph_res[name] = gx
-            p = pymupdf.Point(x + (pen + g.x_offset) * scale, baseline - g.y_offset * scale) * to_pdf
-            ops.append(f"q {scale:.6f} 0 0 {scale:.6f} {p.x:.3f} {p.y:.3f} cm /{name} Do Q")
-        pen += g.x_advance
-    width = pen * scale
+            p = pymupdf.Point(x + (pen + g.x_offset * scale) * sx, baseline - g.y_offset * scale) * to_pdf
+            ops.append(f"q {scale * sx:.6f} 0 0 {scale:.6f} {p.x:.3f} {p.y:.3f} cm /{name} Do Q")
+        pen += g.x_advance * scale + per_space.get(i, 0.0)
+    width = pen * sx
 
     # 2. invisible text: ONE run for the whole line, horizontally scaled so it
     #    spans the shaped width. Per-cluster runs line up highlights more
@@ -382,7 +446,8 @@ def insert_khmer_text(page: pymupdf.Page, rect: pymupdf.Rect, text: str,
                       font: KhmerFont | None = None, size: float = 12,
                       color: tuple[float, float, float] = (0, 0, 0),
                       align: str = "left", wrap_text: bool = True,
-                      baseline: float | None = None) -> pymupdf.Rect:
+                      baseline: float | None = None,
+                      fit_width: float | None = None) -> pymupdf.Rect:
     """Write shaped, searchable Khmer text into `rect` (page coordinates as
     displayed). Returns the rect covered by the text."""
     font = font or default_font()
@@ -404,7 +469,8 @@ def insert_khmer_text(page: pymupdf.Page, rect: pymupdf.Rect, text: str,
             elif align == "right":
                 x = rect.x1 - w
             if line.strip(" " + ZERO_WIDTH):
-                used |= _write_line(page, font, line, x, y, size, color, to_pdf)
+                used |= _write_line(page, font, line, x, y, size, color, to_pdf,
+                                    fit_width if len(lines) == 1 else None)
             y += font.line_height(size)
     finally:
         if rotation:
@@ -427,6 +493,7 @@ class TextLine:
     xref: int = 0        # Form XObject of a line written by this app (0 = foreign text)
     original: str = ""   # what the PDF's own text layer says (may be broken)
     recovered: bool = False  # text was rebuilt from the glyphs with a reference font
+    approx: bool = False     # best-effort repair (font unknown): may contain mistakes
 
 
 def _own_lines(page: pymupdf.Page) -> list[TextLine]:
@@ -460,8 +527,9 @@ def text_lines(page: pymupdf.Page) -> list[TextLine]:
         if any(centre in o.rect for o in own):
             continue
         found.append(TextLine(rect=f.rect, text=f.text, size=f.size, font=f.font, color=f.color,
-                              baseline=f.baseline, garbled=not f.recovered and looks_broken(f.text),
-                              original=f.original, recovered=f.recovered))
+                              baseline=f.baseline,
+                              garbled=not (f.recovered or f.approx) and looks_broken(f.text),
+                              original=f.original, recovered=f.recovered, approx=f.approx))
     return own + found
 
 
@@ -489,8 +557,11 @@ def replace_text(page: pymupdf.Page, line: TextLine, new_text: str,
     if not new_text.strip():
         return pymupdf.Rect(line.rect)
     target = pymupdf.Rect(line.rect.x0, line.rect.y0, page.rect.x1 - 18, line.rect.y1)
+    # Keep the paragraph's shape: an edited line ends where the original did
+    # (justified text), unless the new text is much longer or shorter.
     return insert_khmer_text(page, target, new_text, font=font, size=size or line.size,
-                             color=color or line.color, wrap_text=False, baseline=line.baseline)
+                             color=color or line.color, wrap_text=False, baseline=line.baseline,
+                             fit_width=line.rect.width if "\n" not in new_text else None)
 
 
 def search(page: pymupdf.Page, query: str) -> list[pymupdf.Rect]:

@@ -152,3 +152,27 @@ def test_search_returns_one_rect_per_match():
     page = _doc_with("សាលាអន្តរជាតិ ហ្វតព្រីនស៍ និង ហ្វតព្រីនស៍", size=16)[0]
     assert len(search(page, "ហ្វតព្រីនស៍")) == 2
     assert len(search(page, "ស្ត្រី")) == 0
+
+
+def test_line_starting_with_english_still_shapes_khmer():
+    """HarfBuzz guesses one script per buffer from the first letter; a line
+    starting with an English word used to lose its Khmer subscripts."""
+    f = default_font()
+    khmer = "វិទ្យាស្ថានសិក្សាអំពីមនុស្សធម៌អន្តរជាតិ"
+    mixed = f.shape("Justice " + khmer)
+    alone = f.shape(khmer)
+    assert [g.gid for g in mixed][-len(alone):] == [g.gid for g in alone]
+    assert f.shape("") == []
+    page = _doc_with("Justice " + khmer + " Aix-Marseille", size=12)[0]
+    assert "".join(page.get_text().split()) == "Justice" + khmer + "Aix-Marseille"
+
+
+def test_edited_line_keeps_original_width():
+    """A justified line that is edited ends where the original did."""
+    doc = _doc_with("សាលាអន្តរជាតិ ហ្វតព្រីនស៍ ភ្នំពេញ", size=14)
+    page = doc[0]
+    line = text_lines(page)[0]
+    target = line.rect.width * 1.06  # pretend the original was justified a bit wider
+    line.rect.x1 = line.rect.x0 + target
+    r = replace_text(page, line, "សាលាអន្តរជាតិ ហ្វតព្រីនស៍ ខេត្ត")
+    assert abs(r.width - target) < 0.5

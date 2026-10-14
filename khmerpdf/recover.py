@@ -13,6 +13,7 @@ reference font, its outlines are compared with the PDF's embedded subset.
 """
 from __future__ import annotations
 
+import itertools
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -54,6 +55,29 @@ class GlyphDecoder:
         self.single: dict[int, str] = {}
         self._build()
         self.maxlen = max(len(k) for k in self.seq)
+        # Order-insensitive index: Word (Uniscribe) sometimes orders a
+        # syllable's glyphs differently from HarfBuzz. Keyed by the sorted
+        # glyphs; only keys that identify exactly one syllable are kept.
+        bag: dict[tuple[int, ...], str | None] = {}
+        for g, t in self.seq.items():
+            if len(g) >= 2:
+                k = tuple(sorted(g))
+                bag[k] = t if k not in bag or bag[k] == t else None
+        self.bag = {k: t for k, t in bag.items() if t is not None}
+        # Pre-base glyphs (េ ែ ៃ and the pre-base ្រ) always START a syllable,
+        # so an order-insensitive window may never end on one.
+        self.prebase: set[int] = set()
+        for c in CONS:
+            base = self._shape(c)
+            for x in ("\u17c1", "\u17c2", "\u17c3", "\u17d2\u179a"):
+                g = self._shape(c + x)
+                if len(g) >= 2 and g[0] not in base:
+                    self.prebase.add(g[0])
+        # Base glyphs (a consonant / independent vowel, alone or ligated with
+        # its vowel): a syllable has exactly one, so a window with two spans
+        # two syllables.
+        self.bases: set[int] = {g[0] for g, t in self.seq.items()
+                                if len(g) == 1 and t and ("\u1780" <= t[0] <= "\u17b3")}
 
     def _shape(self, text: str) -> tuple[int, ...]:
         buf = hb.Buffer()
@@ -77,6 +101,9 @@ class GlyphDecoder:
                     add(c + sh + v)
                     for f in COMMON_FINAL:
                         add(c + sh + v + f)
+                for s1 in SUBS:  # e.g. ហ្ស៊ួ (subscript + register shifter + vowel)
+                    for v in VOWELS:
+                        add(c + s1 + sh + v)
         for c in CONS:
             for s1 in [""] + SUBS:
                 for v in VOWELS:
@@ -110,26 +137,55 @@ class GlyphDecoder:
         """tokens: (glyph id or -1 for 'not decodable', the PDF's own text)."""
         return self.decode_scored(tokens)[0]
 
-    def decode_scored(self, tokens: list[tuple[int, str]]) -> tuple[str, int]:
-        """Decoded text + number of glyphs that matched no known syllable."""
-        out, i, misses = [], 0, 0
-        gids = [t[0] for t in tokens]
+    def decode_scored(self, tokens: list[tuple]) -> tuple[str, float]:
+        """Decoded text + a miss score: 1 per glyph that matched no known
+        syllable, 0.5 per syllable matched only with its glyphs reordered.
+        A token's glyph may be an int or a tuple of candidate glyph IDs (when
+        several glyphs of the font share one outline); the decoder picks the
+        candidates that form a known syllable, in preference order."""
+        out, i, misses = [], 0, 0.0
+        cands = [t[0] if isinstance(t[0], tuple) else ((t[0],) if t[0] >= 0 else ()) for t in tokens]
         while i < len(tokens):
-            if gids[i] >= 0:
-                for n in range(min(self.maxlen, len(tokens) - i), 0, -1):
-                    t = self.seq.get(tuple(gids[i:i + n]))
-                    if t is not None:
-                        out.append(t)
-                        i += n
-                        break
-                else:
-                    out.append(self.single.get(gids[i], tokens[i][1]))
-                    misses += 1
-                    i += 1
-            else:
+            if not cands[i]:
                 out.append(tokens[i][1])
                 i += 1
+                continue
+            # longest exact match vs longest order-insensitive match;
+            # take the longer one (exact wins ties)
+            exact = bag = (0, None)
+            for n in range(min(self.maxlen, len(tokens) - i), 0, -1):
+                t = self._lookup(cands[i:i + n], self.seq, ordered=True)
+                if t is not None:
+                    exact = (n, t)
+                    break
+            for n in range(min(self.maxlen, len(tokens) - i), max(exact[0], 1), -1):
+                t = self._lookup(cands[i:i + n], self.bag, ordered=False)
+                if t is not None:
+                    bag = (n, t)
+                    break
+            n, t = bag if bag[0] > exact[0] else exact
+            if t is not None:
+                out.append(t)
+                i += n
+                if bag[0] > exact[0]:
+                    misses += 0.5  # tolerated a glyph-order difference
+            else:
+                out.append(self.single.get(cands[i][0], tokens[i][1]))
+                misses += 1
+                i += 1
         return "".join(out), misses
+
+    def _lookup(self, window: list[tuple[int, ...]], table: dict, ordered: bool) -> str | None:
+        if any(not c for c in window):
+            return None
+        for combo in itertools.islice(itertools.product(*window), 32):
+            if not ordered and (combo[-1] in self.prebase
+                                or sum(1 for w in combo if w in self.bases) > 1):
+                continue
+            t = table.get(combo if ordered else tuple(sorted(combo)))
+            if t is not None:
+                return t
+        return None
 
 
 @lru_cache(maxsize=None)
@@ -169,25 +225,114 @@ def _outlines(font: hb.Font, gid: int):
     return pen.ops
 
 
-def _matches(embedded: bytes, ref_path: str, gids: list[int]) -> bool:
-    """Same glyph outlines at the same glyph IDs => same font (version)."""
-    emb = hb.Font(hb.Face(embedded))
-    ref = decoder(ref_path).font
-    checked = 0
+@lru_cache(maxsize=None)
+def _ref_font(path: str) -> hb.Font:
+    return hb.Font(hb.Face(Path(path).read_bytes()))
+
+
+@lru_cache(maxsize=None)
+def _shape_index(path: str) -> dict[tuple, tuple[int, ...]]:
+    """Glyph outline -> every glyph ID with that outline (some glyphs share
+    an outline, e.g. subscript ta/da in Khmer OS). Cheap: no dictionary."""
+    font = _ref_font(path)
+    index: dict[tuple, list[int]] = {}
+    for gid in range(font.face.glyph_count):
+        ops = tuple(_outlines(font, gid))
+        if ops:
+            index.setdefault(ops, []).append(gid)
+    return {k: tuple(v) for k, v in index.items()}
+
+
+# Among glyphs that look identical, prefer the more common character
+PREFER = {"\u178f": 0, "\u178a": 1}  # ត before ដ (subscripts ្ត / ្ដ)
+
+
+def _glyph_map(emb: hb.Font, ref_path: str, gids: list[int]) -> dict[int, tuple[int, ...]] | None:
+    """Map the embedded font's glyph IDs to the reference font's, by outline.
+    Works for subsets that keep the original IDs and for renumbered subsets.
+    None unless (nearly) every drawn glyph is found in the reference font."""
+    index = _shape_index(ref_path)
+    ref_font = _ref_font(ref_path)
+    mapping: dict[int, tuple[int, ...]] = {}
+    drawn = missing = 0
     for g in gids:
-        a = _outlines(emb, g)
-        if not a:
+        ops = tuple(_outlines(emb, g))
+        if not ops:
+            continue  # blank glyphs (space, ZWSP) prove nothing
+        drawn += 1
+        # Same ID with the same outline wins: it tells look-alikes apart.
+        if g < ref_font.face.glyph_count and tuple(_outlines(ref_font, g)) == ops:
+            mapping[g] = (g,)
             continue
-        if a != _outlines(ref, g):
+        ref = index.get(ops)
+        if ref is None:
+            missing += 1
+            if missing > max(1, drawn // 20):
+                return None
+        else:
+            mapping[g] = ref
+    return mapping if drawn and len(mapping) >= 0.95 * drawn else None
+
+
+class MappedDecoder:
+    """A reference-font decoder plus the PDF-glyph -> reference-glyph mapping
+    for one embedded font. The mapping grows as more pages are read."""
+
+    def __init__(self, path: str, emb: hb.Font):
+        self.path = path
+        self.dec = decoder(path)
+        self.emb = emb
+        self.mapping: dict[int, tuple[int, ...]] = {}
+        self.same_ids = True
+
+    def extend(self, gids: list[int]) -> bool:
+        new = [g for g in gids if g not in self.mapping]
+        if not new:
+            return True
+        m = _glyph_map(self.emb, self.path, new)
+        if m is None and any(_outlines(self.emb, g) for g in new):
             return False
-        checked += 1
-        if checked >= 12:
-            break
-    return checked > 0
+        m = m or {}
+        self.same_ids &= all(b == (a,) for a, b in m.items())
+        m = {g: tuple(sorted(c, key=self._rank)) for g, c in m.items()}
+        self.mapping.update(m)
+        # blank glyphs (space / ZWSP) can't be matched by outline; when the PDF
+        # kept the font's own glyph IDs, keep theirs too
+        if self.same_ids:
+            n = self.dec.font.face.glyph_count
+            self.mapping.update({g: (g,) for g in new if g not in self.mapping and g < n})
+        return True
+
+    def _rank(self, g: int) -> tuple:
+        """Among look-alike glyphs, try the more common character first."""
+        t = self.dec.single.get(g, "")
+        return (PREFER.get(t[-1:], 1) if t else 2, g)
+
+    def decode_scored(self, tokens: list[tuple[int, str]]) -> tuple[str, float]:
+        return self.dec.decode_scored([(self.mapping.get(g, ()) if g >= 0 else (), t) for g, t in tokens])
 
 
-def page_decoders(page: pymupdf.Page) -> dict[str, GlyphDecoder]:
-    """Decoders for this page's embedded fonts, keyed by normalised name."""
+def _identify(doc: pymupdf.Document, xref: int, preferred: str | None, gids: list[int]) -> MappedDecoder | None:
+    """Find which reference font (bundled or installed) the PDF's embedded
+    font is, by glyph outlines - not by name, which is often renamed."""
+    try:
+        buf = doc.extract_font(xref)[3]
+    except Exception:
+        return None
+    if not buf:
+        return None
+    emb = hb.Font(hb.Face(buf))
+    candidates = list(dict.fromkeys(([preferred] if preferred else []) + list(reference_fonts().values())))
+    for path in candidates:
+        if _glyph_map(emb, path, gids):
+            md = MappedDecoder(path, emb)
+            md.extend(gids)
+            return md
+    return None
+
+
+def page_decoders(page: pymupdf.Page) -> dict[str, MappedDecoder]:
+    """Decoders for this page's embedded fonts, keyed by normalised font name."""
     doc = page.parent
     cache = getattr(doc, "_khmerpdf_decoders", None)
     if cache is None:
@@ -196,35 +341,32 @@ def page_decoders(page: pymupdf.Page) -> dict[str, GlyphDecoder]:
             doc._khmerpdf_decoders = cache
         except AttributeError:
             pass
-    out: dict[str, GlyphDecoder] = {}
     refs = reference_fonts()
-    # The glyph trace names fonts by their internal name ('KhmerOSsys'); the
-    # PDF's font dictionary may use the display name ('Khmer OS System').
-    # Both resolve to the same reference font file.
-    gids_by_ref: dict[str, list[int]] = {}
-    trace_keys_by_ref: dict[str, set[str]] = {}
+    gids_by_key: dict[str, set[int]] = {}
     for sp in page.get_texttrace():
-        key = _norm(sp["font"])
-        ref = refs.get(key)
-        if ref:
-            gids_by_ref.setdefault(ref, []).extend(c[1] for c in sp["chars"] if c[1] > 0)
-            trace_keys_by_ref.setdefault(ref, set()).add(key)
-    for xref, _ext, ftype, basefont, *_ in page.get_fonts(full=True):
-        ref = refs.get(_norm(basefont))
-        if not ref or ref not in gids_by_ref:
+        if any(0x1780 <= c[0] <= 0x17FF for c in sp["chars"]) or any(
+                0x0180 <= c[0] <= 0x024F or 0xE000 <= c[0] <= 0xF8FF for c in sp["chars"]):
+            gids_by_key.setdefault(_norm(sp["font"]), set()).update(c[1] for c in sp["chars"] if c[1] > 0)
+    out: dict[str, MappedDecoder] = {}
+    for xref, _ext, _ftype, basefont, *_ in page.get_fonts(full=True):
+        bkey = _norm(basefont)
+        name_ref = refs.get(bkey)
+        # the glyph trace may name the font differently ('KhmerOSsys' vs
+        # 'Khmer OS System'); link them through the reference file
+        # (MuPDF also truncates long names: 'Khmer OS Siemreap Regula')
+        keys = {k for k in gids_by_key
+                if k == bkey or (name_ref and refs.get(k) == name_ref)
+                or (min(len(k), len(bkey)) >= 6 and (k.startswith(bkey) or bkey.startswith(k)))}
+        if not keys:
             continue
-        if (xref, ref) not in cache:
-            dec = None
-            try:
-                buf = doc.extract_font(xref)[3]
-                if buf and _matches(buf, ref, sorted(set(gids_by_ref[ref]))):
-                    dec = decoder(ref)
-            except Exception:
-                dec = None
-            cache[(xref, ref)] = dec
-        if cache[(xref, ref)]:
-            for key in trace_keys_by_ref[ref] | {_norm(basefont)}:
-                out[key] = cache[(xref, ref)]
+        gids = sorted(set().union(*(gids_by_key[k] for k in keys)))
+        if xref not in cache:
+            cache[xref] = _identify(doc, xref, name_ref, gids)
+        elif cache[xref] and not cache[xref].extend(gids):
+            cache[xref] = None  # this page shows it isn't the same font after all
+        if cache[xref]:
+            for k in keys | {bkey}:
+                out[k] = cache[xref]
     return out
 
 
@@ -240,10 +382,11 @@ class FoundLine:
     color: tuple[float, float, float]
     original: str   # what the PDF's own ToUnicode says
     text: str       # recovered text (== original when nothing to recover)
-    recovered: bool
+    recovered: bool  # rebuilt exactly from the glyphs with a matching font
+    approx: bool = False  # best-effort repair (no matching font): please check
 
 
-def _decode_tokens(tokens: list[tuple[int, str, GlyphDecoder | None]]) -> tuple[str, int]:
+def _decode_tokens(tokens: list[tuple[int, str, "MappedDecoder | None"]]) -> tuple[str, float]:
     """Decode run by run, so a line mixing fonts (e.g. a bold Muol word in
     Battambang text, or Latin in another font) uses the right decoder.
     Returns the text and the number of glyphs that matched no syllable."""
@@ -259,7 +402,7 @@ def _decode_tokens(tokens: list[tuple[int, str, GlyphDecoder | None]]) -> tuple[
             run = []
         cur = d
         run.append((g, t, d))
-    return "".join(out).strip(), misses
+    return "".join(out).replace("\xa0", " ").strip(), misses
 
 
 def _visual_order(glyphs: list) -> list:
@@ -354,13 +497,88 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = ()) -> list[Fou
             for order in (gl, _visual_order(gl)):
                 candidates.append(_decode_tokens([(g[3] if g[8] else -1, g[4], g[8]) for g in order]))
             text = min(candidates, key=lambda c: c[1])[0]
+        approx = False
+        if text == original and looks_broken(original):
+            repaired = repair_visual_order(_visual_order(gl))  # normalise logical-order streams first
+            if repaired and repaired != original:
+                text, approx = repaired, True
         rect = pymupdf.Rect(seg["x0"], min(g[2][1] for g in gl), seg["x1"], max(g[2][3] for g in gl))
         bases = [g for g in gl if not _is_mark(ord(g[4][0]) if g[4] else 0, g[2], g[5])] or gl
         main = max(set((g[5], g[6], g[7]) for g in bases), key=lambda k: sum(1 for g in bases if (g[5], g[6], g[7]) == k))
         out.append(FoundLine(rect=rect, baseline=seg["baseline"], size=round(main[0] * 2) / 2,
                              font=main[1], color=main[2], original=original, text=text,
-                             recovered=text != original))
+                             recovered=text != original and not approx, approx=approx))
     return out
+
+
+# --------------------------------------------------------------------------
+# Best-effort repair when no matching font is available
+# --------------------------------------------------------------------------
+_PREBASE_VOWELS = ("\u17c1", "\u17c2", "\u17c3")       # េ ែ ៃ
+_SPLIT_VOWELS = {("\u17c1", "\u17b6"): "\u17c4",        # េ + ា = ោ
+                 ("\u17c1", "\u17b8"): "\u17be",        # េ + ី = ើ
+                 ("\u17c1", "\u17c5"): "\u17c5"}        # េ + ៅ-tail = ៅ
+
+
+def _is_base(t: str) -> bool:
+    return bool(t) and "\u1780" <= t[0] <= "\u17b3"
+
+
+def repair_visual_order(glyphs: list) -> str:
+    """Rebuild logical Khmer from a glyph run whose PDF text mapping is broken,
+    using only the PDF's own mapping plus Khmer rules (no font needed):
+      * a consonant glyph with (almost) no width is a subscript -> add COENG
+      * pre-base vowels (េ ែ ៃ) and the pre-base ្រ move after their consonant
+        (and its subscripts); េ + ា -> ោ, េ + ី -> ើ
+      * junk characters (Latin Ext-B, private use, U+FFFD) are dropped
+    Good for most syllables; ligature glyphs mapped to junk are lost."""
+    toks: list[str] = []
+    for g in glyphs:
+        t = _JUNK.sub("", g[4])
+        if not t:
+            continue
+        w = g[2][2] - g[2][0]
+        em = w / g[5] if g[5] else 0
+        if len(t) == 1 and "\u1780" <= t <= "\u17a2":
+            if w < 0.05 * g[5] and toks:
+                t = "\u17d2" + t                      # zero-width consonant = subscript
+        elif t == "\u17d2" and em > 0.1:
+            t = "\u17d2\u179a"                        # a COENG with width = the pre-base ្រ
+        toks.append(t)
+    out: list[str] = []
+    i = 0
+    while i < len(toks):
+        pre_vowel, pre_ro = None, False
+        while i < len(toks) and (toks[i] in _PREBASE_VOWELS or toks[i] == "\u17d2\u179a"):
+            nxt = next((t for t in toks[i + 1:] if t not in _PREBASE_VOWELS and t != "\u17d2\u179a"), "")
+            if not _is_base(nxt):
+                break
+            if toks[i] == "\u17d2\u179a":
+                pre_ro = True
+            else:
+                pre_vowel = toks[i]
+            i += 1
+        if i >= len(toks):
+            out += [pre_vowel or ""] + (["\u17d2\u179a"] if pre_ro else [])
+            break
+        if pre_vowel is None and not pre_ro:
+            out.append(toks[i])
+            i += 1
+            continue
+        out.append(toks[i])  # the base consonant
+        i += 1
+        while i < len(toks) and toks[i].startswith("\u17d2") and toks[i] != "\u17d2\u179a":
+            out.append(toks[i])  # its subscripts
+            i += 1
+        if pre_ro:
+            out.append("\u17d2\u179a")
+        if pre_vowel:
+            if i < len(toks) and (pre_vowel, toks[i]) in _SPLIT_VOWELS:
+                out.append(_SPLIT_VOWELS[(pre_vowel, toks[i])])
+                i += 1
+            else:
+                out.append(pre_vowel)
+    return "".join(out).replace("\xa0", " ").strip()
 
 
 # --------------------------------------------------------------------------
