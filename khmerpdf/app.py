@@ -455,6 +455,9 @@ class MainWindow(QMainWindow):
         if line.garbled:
             self.statusBar().showMessage("This line's text can't be read from the PDF (its text layer is broken "
                                          "and no matching font was found). Type the replacement text.")
+        elif line.approx:
+            self.statusBar().showMessage("⚠ This PDF's font isn't available, so the text was rebuilt with Khmer "
+                                         "spelling rules and may contain mistakes. Please check it before saving.")
         elif line.recovered:
             self.statusBar().showMessage(f"Text recovered from the glyphs ({font or line.font}). "
                                          "Enter = save, Shift+Enter = new line, Esc = cancel.")
@@ -462,7 +465,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Enter = save, Shift+Enter = new line, Esc = cancel.")
         if not font:
             font = self.cur_font
-            if line.font:
+            if line.font and not (line.approx or line.garbled):
                 self.statusBar().showMessage(f"The PDF's font “{line.font}” isn't available; using {font}. "
                                              "Pick another font in the toolbar if you like.")
         self._open_inline("edit", line, line.rect, "" if line.garbled else line.text,
@@ -504,8 +507,10 @@ class MainWindow(QMainWindow):
             return
         ed = self.inline["editor"]
         ed.setFont(self.fonts.qfont(self.cur_font, self.cur_size * self.canvas.scale))
+        line = self.inline.get("line")
+        border = "#d98200" if line is not None and (line.approx or line.garbled) else "#0078d7"
         ed.setStyleSheet(f"QPlainTextEdit {{ color: {self.cur_color.name()}; background: white; "
-                         "border: 2px solid #0078d7; border-radius: 3px; }")
+                         f"border: 2px solid {border}; border-radius: 3px; }}")
         ed.fit()
 
     def _close_inline(self, save: bool) -> None:
