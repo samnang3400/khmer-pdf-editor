@@ -21,6 +21,7 @@ Why other editors break Khmer, and what we do instead:
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -90,9 +91,39 @@ def load_font(path: str) -> KhmerFont:
     return KhmerFont(path)
 
 
+_KHMEROS_NAMES = {
+    "KhmerOS": "Khmer OS", "KhmerOSsys": "Khmer OS System", "KhmerOSbattambang": "Khmer OS Battambang",
+    "KhmerOSsiemreap": "Khmer OS Siemreap", "KhmerOScontent": "Khmer OS Content",
+    "KhmerOSbokor": "Khmer OS Bokor", "KhmerOSmuol": "Khmer OS Muol", "KhmerOSmuollight": "Khmer OS Muol Light",
+    "KhmerOSmuolpali": "Khmer OS Muol Pali", "KhmerOSmetalchrieng": "Khmer OS Metal Chrieng",
+    "KhmerOSfasthand": "Khmer OS Fasthand", "KhmerOSfreehand": "Khmer OS Freehand",
+}
+
+
 def bundled_fonts() -> dict[str, str]:
-    """Display name -> path for fonts shipped with the app."""
-    return {p.stem.replace("-", " "): str(p) for p in sorted(FONT_DIR.glob("*.ttf"))}
+    """Display name -> path for fonts shipped with the app (Google Fonts Khmer
+    fonts + the Khmer OS family, which most Khmer Word documents use)."""
+    out = {p.stem.replace("-", " "): str(p) for p in sorted(FONT_DIR.glob("*.ttf"))}
+    for p in sorted((FONT_DIR / "khmeros").glob("*.ttf")):
+        out[_KHMEROS_NAMES.get(p.stem, p.stem)] = str(p)
+    return out
+
+
+def norm_font_name(name: str) -> str:
+    """'LDIPBJ+KhmerOSbattambang', 'Khmer OS Battambang', 'KhmerOSbattambang.ttf'
+    -> 'khmerosbattambang' (for matching PDF font names to font files)."""
+    name = re.sub(r"^[A-Z]{6}\+", "", Path(name).stem if name.lower().endswith((".ttf", ".otf")) else name)
+    name = re.sub(r"(?i)[-_ ]?(regular|normal)$", "", name)
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def match_font(fonts: dict[str, str], pdf_font: str) -> str | None:
+    """Name of the available font that is the same as a PDF's font, if any."""
+    key = norm_font_name(pdf_font)
+    for name, path in fonts.items():
+        if key in (norm_font_name(name), norm_font_name(Path(path).name)):
+            return name
+    return None
 
 
 _KHMER_FONT_HINTS = ("khmer", "daunpenh", "moolboran", "battambang", "siemreap", "kantumruy",
@@ -392,14 +423,10 @@ class TextLine:
     font: str
     color: tuple[float, float, float]
     baseline: float
-    garbled: bool      # True when the PDF's own Unicode mapping looks broken
-    xref: int = 0      # Form XObject of a line written by this app (0 = foreign text)
-
-
-def _looks_garbled(s: str) -> bool:
-    """Khmer PDFs with broken ToUnicode usually extract as Latin-1 / PUA junk."""
-    bad = sum(1 for c in s if ("À" <= c <= "ɏ") or ("" <= c <= "") or c == "�")
-    return bad > 0 and bad >= max(1, len(s.strip()) // 5)
+    garbled: bool        # the PDF's text for this line is broken and could not be recovered
+    xref: int = 0        # Form XObject of a line written by this app (0 = foreign text)
+    original: str = ""   # what the PDF's own text layer says (may be broken)
+    recovered: bool = False  # text was rebuilt from the glyphs with a reference font
 
 
 def _own_lines(page: pymupdf.Page) -> list[TextLine]:
@@ -421,31 +448,21 @@ def _own_lines(page: pymupdf.Page) -> list[TextLine]:
 
 
 def text_lines(page: pymupdf.Page) -> list[TextLine]:
-    """Lines written by this app (exact text/font/size) + other text on the page."""
+    """Lines written by this app (exact text/font/size) + other text on the page.
+    Other text is recovered from its glyphs when the PDF's own text layer is
+    broken and a matching reference font is available (see recover.py)."""
+    from .recover import find_lines, looks_broken
+
     own = _own_lines(page)
-    out = list(own)
-    d = page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_WHITESPACE)
-    for block in d["blocks"]:
-        for line in block.get("lines", []):
-            spans = [s for s in line["spans"] if s["text"].strip()]
-            if not spans:
-                continue
-            r = pymupdf.Rect(line["bbox"])
-            centre = (r.tl + r.br) / 2
-            if any(centre in o.rect for o in own) or spans[0]["font"] == TEXT_FONT:
-                continue  # the invisible layer of one of our lines
-            main = max(spans, key=lambda sp: len(sp["text"].strip()))
-            # Span "size" is unreliable for scaled text, so derive it from
-            # geometry: height / (ascender - descender).
-            em = main["ascender"] - main["descender"]
-            size = (main["bbox"][3] - main["bbox"][1]) / em if em > 0 else main["size"]
-            c = main["color"]
-            text = "".join(s["text"] for s in line["spans"]).strip()
-            out.append(TextLine(
-                rect=r, text=text, size=round(size * 2) / 2, font=main["font"],
-                color=((c >> 16 & 255) / 255, (c >> 8 & 255) / 255, (c & 255) / 255),
-                baseline=main["origin"][1], garbled=_looks_garbled(text)))
-    return out
+    found = []
+    for f in find_lines(page, skip_fonts=(TEXT_FONT,)):
+        centre = (f.rect.tl + f.rect.br) / 2
+        if any(centre in o.rect for o in own):
+            continue
+        found.append(TextLine(rect=f.rect, text=f.text, size=f.size, font=f.font, color=f.color,
+                              baseline=f.baseline, garbled=not f.recovered and looks_broken(f.text),
+                              original=f.original, recovered=f.recovered))
+    return own + found
 
 
 def delete_line(page: pymupdf.Page, line: TextLine) -> None:

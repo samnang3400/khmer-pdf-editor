@@ -131,7 +131,8 @@ def test_edit_pdf_with_broken_khmer_text_layer():
                         archive=pymupdf.Archive(str(FONT_DIR)))
     page = pymupdf.open(stream=doc.tobytes())
     line = text_lines(page[0])[0]
-    assert line.text != "សាលាអន្តរជាតិ"  # the original text layer is broken
+    assert line.original != "សាលាអន្តរជាតិ"  # the PDF's own text layer is broken...
+    assert line.recovered and line.text == "សាលាអន្តរជាតិ"  # ...but the glyphs decode
     replace_text(page[0], line, "សាលាអន្តរជាតិ ហ្វតព្រីនស៍")
     assert pymupdf.open(stream=page.tobytes())[0].get_text().strip() == "សាលាអន្តរជាតិ ហ្វតព្រីនស៍"
 
