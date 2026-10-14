@@ -29,7 +29,7 @@ def test_roundtrip_poppler(tmp_path):
     text = " ".join(SAMPLES)
     fn = tmp_path / "p.pdf"
     _doc_with(text, size=14).save(fn)
-    out = subprocess.run(["pdftotext", str(fn), "-"], capture_output=True, text=True).stdout
+    out = subprocess.run(["pdftotext", "-enc", "UTF-8", str(fn), "-"], capture_output=True).stdout.decode("utf-8")
     assert "".join(out.split()) == "".join(text.split())
 
 
