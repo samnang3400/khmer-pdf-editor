@@ -1,2 +1,2 @@
 """KhmerPDF Editor - a PDF editor built for Khmer (Unicode) text."""
-__version__ = "0.2.0"
+__version__ = "0.3.0"

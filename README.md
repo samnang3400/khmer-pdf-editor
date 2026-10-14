@@ -19,11 +19,16 @@ The pdf.js test runs when `PDFJS_DIR` points to a folder containing `node_module
 
 Lines written by the app also store their own text, font, size and colour, so editing them is exact.
 
-## Features (v0.2)
+## Features (v0.3)
 
 - Open, view, zoom, and page through PDFs (drag and drop works too)
 - **Edit Text**: click any line and edit it right on the page (Enter = save, Shift+Enter = new line,
-  Esc = cancel, clicking elsewhere saves). Text from broken Khmer PDFs is recovered first
+  Esc = cancel, clicking elsewhere saves). Text from broken Khmer PDFs is recovered first. An edited
+  line keeps the original's width (justified paragraphs keep their right edge)
+- **Recovery of broken Khmer PDFs**: the PDF's font is identified by its glyph *shapes* (works for
+  renamed fonts and renumbered subsets) against the bundled Khmer OS fonts and fonts installed on the PC;
+  differences in glyph order between Word and HarfBuzz are tolerated. When no font matches, the text is
+  rebuilt with Khmer spelling rules and marked as *please check* (orange border)
 - **Add Text**: drag a box (or click) and type in place; font, size and colour from the toolbar
 - **Word break** button inserts an invisible Khmer word break (ZWSP) where a line may wrap
 - **Find** Khmer or English across the document (Ctrl+F)
@@ -75,8 +80,10 @@ and optionally adds KhmerPDF to *Open with* for PDFs without changing the defaul
 - **Phase 3:** page operations (merge, split, rotate, reorder), form filling, signatures, annotations
 - Rotated pages are supported for adding text, but less tested than upright pages
 - Editing changes one line at a time; a justified paragraph doesn't reflow yet
-- Recovery needs the same font the PDF used (the bundled Khmer OS fonts, or one installed on the PC).
-  Spellings that look identical (`ក្ត`/`ក្ដ`) come back in their most common form
+- Exact recovery needs the same font the PDF used (bundled Khmer OS fonts, or one installed on the PC).
+  Without it, the rule-based repair gets most syllables right but can't see letters hidden in ligatures
+  (e.g. `ា` in Khmer OS's `កា` glyph). Spellings that look identical (`ក្ត`/`ក្ដ`) come back in their
+  most common form
 - Search highlights are spread evenly across a line, so they can be slightly offset within long lines
 - Unsigned installer: Windows SmartScreen will warn until the app is code-signed
 
