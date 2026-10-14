@@ -7,23 +7,22 @@ import tempfile
 from pathlib import Path
 
 import pymupdf
-from PySide6.QtCore import QPoint, QRect, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontDatabase, QIcon,
-                           QImage, QKeySequence, QPainter, QPen, QPixmap)
-from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDialog,
-                               QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-                               QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
+from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontDatabase, QFontMetricsF,
+                           QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap)
+from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDoubleSpinBox,
+                               QFileDialog, QLabel, QLineEdit, QMainWindow, QMessageBox,
                                QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QToolBar,
-                               QVBoxLayout, QWidget)
+                               QWidget)
 
 from . import __version__
-from .engine import (TextLine, bundled_fonts, insert_khmer_text, load_font,
+from .engine import (TextLine, bundled_fonts, insert_khmer_text, load_font, match_font,
                      replace_text, search, system_khmer_fonts, text_lines)
 
 APP_NAME = "KhmerPDF Editor"
 SCREEN_DPI = 96
 UNDO_LIMIT = 30
-ZWSP = "​"
+ZWSP = "\u200b"
 
 
 def resource_path(*parts: str) -> Path:
@@ -41,7 +40,8 @@ class Fonts:
         for name, path in bundled_fonts().items():
             self.add(name, path)
         for name, path in system_khmer_fonts().items():
-            if name not in self.paths:
+            # skip installed copies of fonts we already ship (e.g. Khmer OS)
+            if name not in self.paths and not match_font(self.paths, Path(path).name):
                 self.add(name, path)
 
     def add(self, name: str, path: str) -> str:
@@ -51,99 +51,59 @@ class Fonts:
         self.families[name] = fams[0] if fams else "Sans Serif"
         return name
 
-    def qfont(self, name: str, pt: float) -> QFont:
+    def qfont(self, name: str, px: float) -> QFont:
         f = QFont(self.families.get(name, "Sans Serif"))
-        f.setPointSizeF(max(pt, 6))
+        f.setPixelSize(max(round(px), 6))
         return f
 
 
 # --------------------------------------------------------------------------
-# Text entry dialog
+# In-place text editor (sits on the page, over the line being edited)
 # --------------------------------------------------------------------------
-class TextDialog(QDialog):
-    def __init__(self, parent, fonts: Fonts, *, title: str, text: str = "", font: str,
-                 size: float, color: QColor, align: str = "left", show_align=True,
-                 original: TextLine | None = None):
+class InlineEditor(QPlainTextEdit):
+    """Enter = save, Shift+Enter = new line, Esc = cancel."""
+    commit = Signal()
+    cancel = Signal()
+
+    def __init__(self, parent: QWidget, wrap_width: float | None):
         super().__init__(parent)
-        self.setWindowTitle(title)
-        self.fonts = fonts
-        self.color = QColor(color)
-        lay = QVBoxLayout(self)
+        self.wrap_width = wrap_width  # px; None = single line that grows to the right
+        self.min_width = 60.0         # px; at least the width of the line being covered
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setLineWrapMode(QPlainTextEdit.WidgetWidth if wrap_width else QPlainTextEdit.NoWrap)
+        self.document().setDocumentMargin(1)
+        self.textChanged.connect(self.fit)
 
-        if original is not None:
-            msg = QLabel()
-            msg.setWordWrap(True)
-            if original.garbled:
-                msg.setText("<b>The original text can't be read correctly</b> (this PDF has a broken "
-                            "Khmer text layer). Type the replacement text below.<br>"
-                            f"<span style='color:gray'>Extracted: {original.text}</span>")
-            else:
-                msg.setText(f"Original: <b>{original.text}</b>")
-            lay.addWidget(msg)
+    def event(self, e):
+        # keep Esc/Enter for us instead of the window's shortcuts
+        if e.type() == QEvent.ShortcutOverride and e.key() in (Qt.Key_Escape, Qt.Key_Return, Qt.Key_Enter):
+            e.accept()
+            return True
+        return super().event(e)
 
-        self.edit = QPlainTextEdit(text)
-        self.edit.setMinimumSize(520, 160)
-        lay.addWidget(self.edit)
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            self.cancel.emit()
+            return
+        if e.key() in (Qt.Key_Return, Qt.Key_Enter) and not e.modifiers() & Qt.ShiftModifier:
+            self.commit.emit()
+            return
+        super().keyPressEvent(e)
 
-        form = QFormLayout()
-        row = QHBoxLayout()
-        self.font_box = QComboBox()
-        self.font_box.addItems(list(fonts.paths))
-        self.font_box.setCurrentText(font)
-        self.size_box = QDoubleSpinBox()
-        self.size_box.setRange(4, 200)
-        self.size_box.setValue(size)
-        self.color_btn = QPushButton()
-        self.color_btn.setFixedWidth(40)
-        self.color_btn.clicked.connect(self._pick_color)
-        row.addWidget(self.font_box, 1)
-        row.addWidget(QLabel("Size"))
-        row.addWidget(self.size_box)
-        row.addWidget(QLabel("Color"))
-        row.addWidget(self.color_btn)
-        form.addRow("Font", row)
-        self.align_box = QComboBox()
-        self.align_box.addItems(["left", "center", "right"])
-        self.align_box.setCurrentText(align)
-        if show_align:
-            form.addRow("Align", self.align_box)
-        lay.addLayout(form)
-
-        tools = QHBoxLayout()
-        zw = QPushButton("Insert word break (ZWSP)")
-        zw.setToolTip("Khmer has no spaces between words. A zero-width space marks where\n"
-                      "a line may wrap without showing a visible space.")
-        zw.clicked.connect(lambda: self.edit.insertPlainText(ZWSP))
-        tools.addWidget(zw)
-        tools.addStretch()
-        lay.addLayout(tools)
-
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        lay.addWidget(btns)
-
-        self.font_box.currentTextChanged.connect(self._update_preview)
-        self.size_box.valueChanged.connect(self._update_preview)
-        self._update_preview()
-        self.edit.setFocus()
-
-    def _pick_color(self):
-        c = QColorDialog.getColor(self.color, self, "Text color")
-        if c.isValid():
-            self.color = c
-            self._update_preview()
-
-    def _update_preview(self):
-        self.edit.setFont(self.fonts.qfont(self.font_box.currentText(), self.size_box.value() * 1.2))
-        self.color_btn.setStyleSheet(f"background:{self.color.name()}; border:1px solid #888;")
-        self.edit.setStyleSheet(f"color:{self.color.name()};")
-
-    def values(self):
-        c = self.color
-        return dict(text=self.edit.toPlainText(), font=self.font_box.currentText(),
-                    size=self.size_box.value(), color=(c.redF(), c.greenF(), c.blueF()),
-                    align=self.align_box.currentText())
+    def fit(self):
+        """Grow with the text so the editor never shows scrollbars."""
+        fm = QFontMetricsF(self.font())
+        pad = 10
+        if self.wrap_width:
+            # QPlainTextEdit's document height is measured in (wrapped) lines
+            n = max(1, int(self.document().size().height()))
+            w, h = self.wrap_width + pad, n * fm.lineSpacing() + pad
+        else:
+            lines = self.toPlainText().split("\n")
+            w = max(fm.horizontalAdvance(t) for t in lines) + fm.averageCharWidth() * 3 + pad
+            h = len(lines) * fm.lineSpacing() + pad
+        self.resize(int(max(w, self.min_width)), int(h))
 
 
 # --------------------------------------------------------------------------
@@ -152,6 +112,7 @@ class TextDialog(QDialog):
 class PageCanvas(QWidget):
     rect_drawn = Signal(object)    # pymupdf.Rect in page coordinates
     line_clicked = Signal(object)  # TextLine
+    pressed = Signal()             # any click on the page (saves an open in-place editor)
 
     def __init__(self):
         super().__init__()
@@ -200,14 +161,22 @@ class PageCanvas(QWidget):
             p.fillRect(self._drag_rect, QColor(0, 150, 80, 30))
             p.drawRect(self._drag_rect)
 
+    def hit(self, pos: QPoint) -> TextLine | None:
+        pt = self._to_page(pos)
+        return next((ln for ln in self.lines if pt in ln.rect), None)
+
     def mousePressEvent(self, e):
         if e.button() != Qt.LeftButton:
             return
+        self.pressed.emit()  # may save an open editor and re-render the page
+        pos = e.position().toPoint()
         if self.mode == "add":
-            self._drag_start = e.position().toPoint()
+            self._drag_start = pos
             self._drag_rect = QRect(self._drag_start, QSize(0, 0))
-        elif self.mode == "edit" and self.hover:
-            self.line_clicked.emit(self.hover)
+        elif self.mode == "edit":
+            line = self.hit(pos)  # fresh hit-test: the page may have just changed
+            if line:
+                self.line_clicked.emit(line)
 
     def mouseMoveEvent(self, e):
         pos = e.position().toPoint()
@@ -215,8 +184,7 @@ class PageCanvas(QWidget):
             self._drag_rect = QRect(self._drag_start, pos).normalized()
             self.update()
         elif self.mode == "edit":
-            pt = self._to_page(pos)
-            hit = next((ln for ln in self.lines if pt in ln.rect), None)
+            hit = self.hit(pos)
             if hit is not self.hover:
                 self.hover = hit
                 self.setCursor(Qt.PointingHandCursor if hit else Qt.ArrowCursor)
@@ -254,10 +222,12 @@ class MainWindow(QMainWindow):
         self.cur_size = 14.0
         self.cur_color = QColor(0, 0, 0)
         self.search_hits: list[tuple[int, pymupdf.Rect]] = []
+        self.inline: dict | None = None  # the open in-place editor, if any
 
         self.canvas = PageCanvas()
         self.canvas.rect_drawn.connect(self.add_text_at)
         self.canvas.line_clicked.connect(self.edit_line)
+        self.canvas.pressed.connect(lambda: self._close_inline(save=True))
         scroll = QScrollArea()
         scroll.setWidget(self.canvas)
         scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
@@ -334,7 +304,7 @@ class MainWindow(QMainWindow):
         self.size_spin = QDoubleSpinBox()
         self.size_spin.setRange(4, 200)
         self.size_spin.setValue(self.cur_size)
-        self.size_spin.valueChanged.connect(lambda v: setattr(self, "cur_size", v))
+        self.size_spin.valueChanged.connect(self._size_changed)
         tb.addWidget(self.size_spin)
         self.color_btn = QPushButton()
         self.color_btn.setFixedWidth(28)
@@ -342,6 +312,9 @@ class MainWindow(QMainWindow):
         self.color_btn.clicked.connect(self._pick_color)
         self._paint_color_btn()
         tb.addWidget(self.color_btn)
+        self.insert_zwsp_act = act("Word break", self.insert_zwsp, "Ctrl+Shift+Space",
+                                   "Insert an invisible Khmer word break (ZWSP) where a line may wrap")
+        self.insert_zwsp_act.setEnabled(False)
         tb.addSeparator()
 
         self.find_box = QLineEdit()
@@ -364,10 +337,18 @@ class MainWindow(QMainWindow):
         if c.isValid():
             self.cur_color = c
             self._paint_color_btn()
+            self._style_inline()
+        if self.inline:
+            self.inline["editor"].setFocus()
+
+    def _size_changed(self, v: float):
+        self.cur_size = v
+        self._style_inline()
 
     def _font_changed(self, name: str):
         if name != "Add font file…":
             self.cur_font = name
+            self._style_inline()
             return
         path, _ = QFileDialog.getOpenFileName(self, "Add a Khmer font", "", "Fonts (*.ttf *.otf)")
         self.font_box.blockSignals(True)
@@ -381,19 +362,22 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, APP_NAME, f"Could not load font:\n{exc}")
         self.font_box.setCurrentText(self.cur_font)
         self.font_box.blockSignals(False)
+        self._style_inline()
 
     def set_mode(self, mode: str):
+        self._close_inline(save=True)
         self.mode_actions[mode].setChecked(True)
         self.canvas.mode = mode
         self.canvas.hover = None
         self.canvas.setCursor(Qt.CrossCursor if mode == "add" else Qt.ArrowCursor)
-        hints = {"view": "", "add": "Drag a box where the text should go, or click for a default box.",
-                 "edit": "Click a line of text to replace it."}
+        hints = {"view": "", "add": "Drag a box (or click) and type. Enter = save, Shift+Enter = new line.",
+                 "edit": "Click a line of text to edit it in place."}
         self.statusBar().showMessage(hints[mode])
         self.canvas.update()
 
     # ---- document -------------------------------------------------------
     def open_dialog(self):
+        self._close_inline(save=True)
         if not self._confirm_discard():
             return
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF files (*.pdf)")
@@ -424,6 +408,7 @@ class MainWindow(QMainWindow):
     def render(self):
         if not self.doc:
             return
+        self._close_inline(save=True)
         page = self.doc[self.page_no]
         dpr = self.devicePixelRatioF()
         scale = self.zoom * SCREEN_DPI / 72
@@ -460,53 +445,108 @@ class MainWindow(QMainWindow):
         self.render()
         self._refresh_undo_actions()
 
+    # ---- in-place editing -------------------------------------------------
     def add_text_at(self, rect: pymupdf.Rect):
-        if not self.doc:
-            return
-        dlg = TextDialog(self, self.fonts, title="Add text", font=self.cur_font,
-                         size=self.cur_size, color=self.cur_color)
-        if dlg.exec() != QDialog.Accepted:
-            return
-        v = dlg.values()
-        if not v["text"].strip():
-            return
-        self._remember_style(v)
-        self._snapshot()
-        try:
-            insert_khmer_text(self.doc[self.page_no], rect, v["text"], font=load_font(self.fonts.paths[v["font"]]),
-                              size=v["size"], color=v["color"], align=v["align"])
-        except Exception as exc:
-            self._restore(self.undo_stack.pop())
-            QMessageBox.critical(self, APP_NAME, f"Could not add text:\n{exc}")
-            return
-        self._changed()
+        if self.doc:
+            self._open_inline("add", None, rect, "", self.cur_font, self.cur_size, self.cur_color, wrap=True)
 
     def edit_line(self, line: TextLine):
-        c = QColor.fromRgbF(*line.color)
-        dlg = TextDialog(self, self.fonts, title="Edit text", text="" if line.garbled else line.text,
-                         font=line.font if line.font in self.fonts.paths else self.cur_font,
-                         size=line.size, color=c, show_align=False, original=line)
-        if dlg.exec() != QDialog.Accepted:
+        font = match_font(self.fonts.paths, line.font)
+        if line.garbled:
+            self.statusBar().showMessage("This line's text can't be read from the PDF (its text layer is broken "
+                                         "and no matching font was found). Type the replacement text.")
+        elif line.recovered:
+            self.statusBar().showMessage(f"Text recovered from the glyphs ({font or line.font}). "
+                                         "Enter = save, Shift+Enter = new line, Esc = cancel.")
+        else:
+            self.statusBar().showMessage("Enter = save, Shift+Enter = new line, Esc = cancel.")
+        if not font:
+            font = self.cur_font
+            if line.font:
+                self.statusBar().showMessage(f"The PDF's font “{line.font}” isn't available; using {font}. "
+                                             "Pick another font in the toolbar if you like.")
+        self._open_inline("edit", line, line.rect, "" if line.garbled else line.text,
+                          font, line.size, QColor.fromRgbF(*line.color), wrap=False)
+
+    def _open_inline(self, kind, line, rect, text, font, size, color, wrap):
+        self._close_inline(save=True)
+        if kind == "edit":
+            line = next((ln for ln in self.canvas.lines if ln.rect == line.rect), line)
+        # the toolbar shows (and controls) the style of the text being edited
+        for w in (self.font_box, self.size_spin):
+            w.blockSignals(True)
+        self.font_box.setCurrentText(font)
+        self.size_spin.setValue(size)
+        for w in (self.font_box, self.size_spin):
+            w.blockSignals(False)
+        self.cur_font, self.cur_size, self.cur_color = font, size, QColor(color)
+        self._paint_color_btn()
+
+        s = self.canvas.scale
+        ed = InlineEditor(self.canvas, rect.width * s if wrap else None)
+        ed.min_width = rect.width * s + 12  # always cover the original line completely
+        ed.setPlaceholderText("Type the replacement text…" if line is not None and line.garbled else "Type here…")
+        ed.setPlainText(text)
+        ed.commit.connect(lambda: self._close_inline(save=True))
+        ed.cancel.connect(lambda: self._close_inline(save=False))
+        self.inline = dict(editor=ed, kind=kind, line=line, rect=pymupdf.Rect(rect),
+                           start=(text, font, size, QColor(color).name()))
+        self._style_inline()
+        top = (line.baseline - size * 1.0) * s if line is not None else rect.y0 * s
+        ed.move(int(rect.x0 * s) - 5, int(min(top, rect.y0 * s)) - 5)
+        ed.show()
+        ed.setFocus()
+        ed.moveCursor(ed.textCursor().MoveOperation.End)
+        self.insert_zwsp_act.setEnabled(True)
+
+    def _style_inline(self):
+        if not self.inline:
             return
-        v = dlg.values()
-        self._remember_style(v, size=False)
+        ed = self.inline["editor"]
+        ed.setFont(self.fonts.qfont(self.cur_font, self.cur_size * self.canvas.scale))
+        ed.setStyleSheet(f"QPlainTextEdit {{ color: {self.cur_color.name()}; background: white; "
+                         "border: 2px solid #0078d7; border-radius: 3px; }")
+        ed.fit()
+
+    def _close_inline(self, save: bool) -> None:
+        """Save (or discard) the open in-place editor, if any."""
+        if not getattr(self, "inline", None):
+            return
+        st, self.inline = self.inline, None
+        ed = st["editor"]
+        text = ed.toPlainText()
+        ed.hide()
+        ed.deleteLater()
+        self.insert_zwsp_act.setEnabled(False)
+        self.canvas.setFocus()
+        if not save or not self.doc:
+            return
+        unchanged = (text, self.cur_font, self.cur_size, self.cur_color.name()) == st["start"]
+        if st["kind"] == "add" and not text.strip():
+            return
+        if st["kind"] == "edit" and (unchanged or (st["line"].garbled and not text.strip())):
+            return
+        c = self.cur_color
+        font = load_font(self.fonts.paths[self.cur_font])
         self._snapshot()
         try:
-            replace_text(self.doc[self.page_no], line, v["text"], font=load_font(self.fonts.paths[v["font"]]),
-                         size=v["size"], color=v["color"])
+            page = self.doc[self.page_no]
+            if st["kind"] == "add":
+                insert_khmer_text(page, st["rect"], text, font=font, size=self.cur_size,
+                                  color=(c.redF(), c.greenF(), c.blueF()))
+            else:
+                replace_text(page, st["line"], text, font=font, size=self.cur_size,
+                             color=(c.redF(), c.greenF(), c.blueF()))
         except Exception as exc:
             self._restore(self.undo_stack.pop())
-            QMessageBox.critical(self, APP_NAME, f"Could not edit text:\n{exc}")
+            QMessageBox.critical(self, APP_NAME, f"Could not save the text:\n{exc}")
             return
         self._changed()
 
-    def _remember_style(self, v, size=True):
-        self.cur_font = v["font"]
-        self.font_box.setCurrentText(v["font"])
-        if size:
-            self.size_spin.setValue(v["size"])
-        self.cur_color = QColor.fromRgbF(*v["color"])
-        self._paint_color_btn()
+    def insert_zwsp(self):
+        if self.inline:
+            self.inline["editor"].insertPlainText(ZWSP)
+            self.inline["editor"].setFocus()
 
     def _restore(self, state):
         data, page_no = state
@@ -568,6 +608,7 @@ class MainWindow(QMainWindow):
         return self._write(path)
 
     def _write(self, path: str) -> bool:
+        self._close_inline(save=True)
         try:
             fd, tmp = tempfile.mkstemp(suffix=".pdf", dir=str(Path(path).parent))
             os.close(fd)
@@ -596,6 +637,7 @@ class MainWindow(QMainWindow):
 
     # ---- window events --------------------------------------------------
     def closeEvent(self, e):
+        self._close_inline(save=True)
         e.accept() if self._confirm_discard() else e.ignore()
 
     def dragEnterEvent(self, e):
