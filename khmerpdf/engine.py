@@ -551,8 +551,9 @@ def delete_line(page: pymupdf.Page, line: TextLine) -> None:
 
 def replace_text(page: pymupdf.Page, line: TextLine, new_text: str,
                  font: KhmerFont | None = None, size: float | None = None,
-                 color: tuple[float, float, float] | None = None) -> pymupdf.Rect:
-    """Remove a line of text and write `new_text` on the same baseline."""
+                 color: tuple[float, float, float] | None = None, fit: bool = True) -> pymupdf.Rect:
+    """Remove a line of text and write `new_text` on the same baseline.
+    `fit=False` when the user changed the font or size on purpose."""
     delete_line(page, line)
     if not new_text.strip():
         return pymupdf.Rect(line.rect)
@@ -561,7 +562,7 @@ def replace_text(page: pymupdf.Page, line: TextLine, new_text: str,
     # (justified text), unless the new text is much longer or shorter.
     return insert_khmer_text(page, target, new_text, font=font, size=size or line.size,
                              color=color or line.color, wrap_text=False, baseline=line.baseline,
-                             fit_width=line.rect.width if "\n" not in new_text else None)
+                             fit_width=line.rect.width if fit else None)
 
 
 def search(page: pymupdf.Page, query: str) -> list[pymupdf.Rect]:

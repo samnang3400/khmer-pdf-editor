@@ -247,14 +247,19 @@ def _shape_index(path: str) -> dict[tuple, tuple[int, ...]]:
 PREFER = {"\u178f": 0, "\u178a": 1}  # ត before ដ (subscripts ្ត / ្ដ)
 
 
-def _glyph_map(emb: hb.Font, ref_path: str, gids: list[int]) -> dict[int, tuple[int, ...]] | None:
+def _glyph_map(emb: hb.Font, ref_path: str, gids: list[int], known_drawn: int = 0,
+               known_missing: int = 0) -> tuple[dict[int, tuple[int, ...]], int, int] | None:
     """Map the embedded font's glyph IDs to the reference font's, by outline.
     Works for subsets that keep the original IDs and for renumbered subsets.
-    None unless (nearly) every drawn glyph is found in the reference font."""
+    Returns (mapping, drawn, missing), or None unless (nearly) every drawn
+    glyph is found in the reference font. `known_*` count glyphs checked on
+    earlier pages, so the bar applies to the whole font, not just new glyphs."""
     index = _shape_index(ref_path)
     ref_font = _ref_font(ref_path)
     mapping: dict[int, tuple[int, ...]] = {}
     drawn = missing = 0
+    # can't reach 95% any more, however the remaining glyphs turn out
+    give_up = 0.05 * (known_drawn + len(gids)) - known_missing
     for g in gids:
         ops = tuple(_outlines(emb, g))
         if not ops:
@@ -267,11 +272,14 @@ def _glyph_map(emb: hb.Font, ref_path: str, gids: list[int]) -> dict[int, tuple[
         ref = index.get(ops)
         if ref is None:
             missing += 1
-            if missing > max(1, drawn // 20):
+            if missing > give_up:
                 return None
         else:
             mapping[g] = ref
-    return mapping if drawn and len(mapping) >= 0.95 * drawn else None
+    total = known_drawn + drawn
+    if not total or known_missing + missing > 0.05 * total:
+        return None
+    return mapping, drawn, missing
 
 
 class MappedDecoder:
@@ -284,23 +292,33 @@ class MappedDecoder:
         self.emb = emb
         self.mapping: dict[int, tuple[int, ...]] = {}
         self.same_ids = True
+        self.drawn = self.missing = 0
+        self.seen: set[int] = set()
 
     def extend(self, gids: list[int]) -> bool:
-        new = [g for g in gids if g not in self.mapping]
+        new = [g for g in gids if g not in self.seen]
         if not new:
             return True
-        m = _glyph_map(self.emb, self.path, new)
-        if m is None and any(_outlines(self.emb, g) for g in new):
-            return False
-        m = m or {}
+        if not any(_outlines(self.emb, g) for g in new):
+            m = {}
+        else:
+            res = _glyph_map(self.emb, self.path, new, self.drawn, self.missing)
+            if res is None:
+                return False
+            m, drawn, missing = res
+            self.drawn += drawn
+            self.missing += missing
+        self.seen.update(new)
         self.same_ids &= all(b == (a,) for a, b in m.items())
         m = {g: tuple(sorted(c, key=self._rank)) for g, c in m.items()}
         self.mapping.update(m)
         # blank glyphs (space / ZWSP) can't be matched by outline; when the PDF
-        # kept the font's own glyph IDs, keep theirs too
+        # kept the font's own glyph IDs, keep theirs too (drawn glyphs that
+        # didn't match stay unmapped: their outline says they're different)
         if self.same_ids:
             n = self.dec.font.face.glyph_count
-            self.mapping.update({g: (g,) for g in new if g not in self.mapping and g < n})
+            self.mapping.update({g: (g,) for g in new
+                                 if g not in self.mapping and g < n and not _outlines(self.emb, g)})
         return True
 
     def _rank(self, g: int) -> tuple:
@@ -324,9 +342,8 @@ def _identify(doc: pymupdf.Document, xref: int, preferred: str | None, gids: lis
     emb = hb.Font(hb.Face(buf))
     candidates = list(dict.fromkeys(([preferred] if preferred else []) + list(reference_fonts().values())))
     for path in candidates:
-        if _glyph_map(emb, path, gids):
-            md = MappedDecoder(path, emb)
-            md.extend(gids)
+        md = MappedDecoder(path, emb)
+        if md.extend(gids) and md.drawn:
             return md
     return None
 
@@ -348,22 +365,29 @@ def page_decoders(page: pymupdf.Page) -> dict[str, MappedDecoder]:
                 0x0180 <= c[0] <= 0x024F or 0xE000 <= c[0] <= 0xF8FF for c in sp["chars"]):
             gids_by_key.setdefault(_norm(sp["font"]), set()).update(c[1] for c in sp["chars"] if c[1] > 0)
     out: dict[str, MappedDecoder] = {}
-    for xref, _ext, _ftype, basefont, *_ in page.get_fonts(full=True):
+    fonts = page.get_fonts(full=True)
+    page_keys = {_norm(f[3]) for f in fonts}
+    for xref, _ext, _ftype, basefont, *_ in fonts:
         bkey = _norm(basefont)
         name_ref = refs.get(bkey)
         # the glyph trace may name the font differently ('KhmerOSsys' vs
         # 'Khmer OS System'); link them through the reference file
-        # (MuPDF also truncates long names: 'Khmer OS Siemreap Regula')
+        # (MuPDF also truncates long names: 'Khmer OS Siemreap Regula') - but
+        # 'khmeros' is no truncation of 'khmerosbattambang' when both are fonts
         keys = {k for k in gids_by_key
                 if k == bkey or (name_ref and refs.get(k) == name_ref)
-                or (min(len(k), len(bkey)) >= 6 and (k.startswith(bkey) or bkey.startswith(k)))}
+                or (min(len(k), len(bkey)) >= 6 and (k.startswith(bkey) or bkey.startswith(k))
+                    and k not in page_keys and refs.get(k, name_ref) == name_ref)}
         if not keys:
             continue
         gids = sorted(set().union(*(gids_by_key[k] for k in keys)))
-        if xref not in cache:
-            cache[xref] = _identify(doc, xref, name_ref, gids)
-        elif cache[xref] and not cache[xref].extend(gids):
-            cache[xref] = None  # this page shows it isn't the same font after all
+        try:
+            if xref not in cache:
+                cache[xref] = _identify(doc, xref, name_ref, gids)
+            elif cache[xref] and not cache[xref].extend(gids):
+                cache[xref] = None  # this page shows it isn't the same font after all
+        except Exception:
+            cache[xref] = None  # a font HarfBuzz can't read: show the PDF's own text
         if cache[xref]:
             for k in keys | {bkey}:
                 out[k] = cache[xref]
@@ -485,7 +509,7 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = ()) -> list[Fou
     out: list[FoundLine] = []
     for seg in segments:
         gl = seg["glyphs"]
-        original = "".join(g[4] for g in gl).strip()
+        original = "".join(g[4] for g in gl).replace("\xa0", " ").strip()
         if not re.sub(r"[\s\u17b6-\u17d3\u17dd\u200b]", "", original):
             continue
         text = original
@@ -572,6 +596,9 @@ def repair_visual_order(glyphs: list) -> str:
             i += 1
         if pre_ro:
             out.append("\u17d2\u179a")
+        while i < len(toks) and toks[i] in ("\u17c9", "\u17ca"):
+            out.append(toks[i])  # register shifter (៉ ៊) comes before the vowel
+            i += 1
         if pre_vowel:
             if i < len(toks) and (pre_vowel, toks[i]) in _SPLIT_VOWELS:
                 out.append(_SPLIT_VOWELS[(pre_vowel, toks[i])])

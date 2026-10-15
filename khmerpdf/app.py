@@ -541,7 +541,8 @@ class MainWindow(QMainWindow):
                                   color=(c.redF(), c.greenF(), c.blueF()))
             else:
                 replace_text(page, st["line"], text, font=font, size=self.cur_size,
-                             color=(c.redF(), c.greenF(), c.blueF()))
+                             color=(c.redF(), c.greenF(), c.blueF()),
+                             fit=st["start"][1:3] == (self.cur_font, self.cur_size))
         except Exception as exc:
             self._restore(self.undo_stack.pop())
             QMessageBox.critical(self, APP_NAME, f"Could not save the text:\n{exc}")
