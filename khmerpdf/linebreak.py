@@ -2,12 +2,15 @@
 
 Khmer does not separate words with spaces. Break opportunities, best first:
   1. explicit spaces and ZERO WIDTH SPACE (U+200B), which careful typists insert
-  2. orthographic syllable boundaries (fallback when a run is wider than the line)
-
-TODO (phase 2): dictionary-based word segmentation for natural breaks
-in text that has no ZWSP.
+  2. word boundaries found with a Khmer dictionary (ICU's word list, the one
+     browsers use), so text without ZWSP still wraps between words
+  3. orthographic syllable boundaries (fallback when a word is wider than the line)
 """
 from __future__ import annotations
+
+import gzip
+from functools import lru_cache
+from pathlib import Path
 
 COENG = "្"
 ZWSP = "​"
@@ -41,17 +44,82 @@ def syllables(text: str) -> list[str]:
     return out
 
 
+DICTIONARY = Path(__file__).parent / "data" / "khmerdict.txt.gz"
+MAX_WORD_SYLLABLES = 12
+
+
+def _key(word: str) -> str:
+    """Spellings that look the same match: subscript ដ and ត (្ដ / ្ត) are
+    drawn alike and typed either way."""
+    return word.replace("\u17d2\u178a", "\u17d2\u178f")
+
+
+@lru_cache(maxsize=1)
+def dictionary() -> frozenset[str]:
+    """The Khmer word list (about 81,000 words), loaded on first use."""
+    try:
+        with gzip.open(DICTIONARY, "rt", encoding="utf-8") as f:
+            return frozenset(_key(w) for w in (line.strip() for line in f) if w)
+    except OSError:
+        return frozenset()
+
+
+def segment(run: str) -> list[str]:
+    """Split text without spaces into words: the split with the fewest
+    syllables the dictionary doesn't know, then the fewest words. Unknown
+    syllables next to each other (a name, say) stay together as one piece."""
+    syl = syllables(run)
+    if len(syl) < 2 or not any(is_khmer(c) for c in run):
+        return [run] if run else []
+    known = dictionary()
+    n = len(syl)
+    best: list[tuple[int, int] | None] = [(0, 0)] + [None] * n
+    back = [0] * (n + 1)
+    for j in range(1, n + 1):
+        for i in range(max(0, j - MAX_WORD_SYLLABLES), j):
+            if best[i] is None:
+                continue
+            word = _key("".join(syl[i:j])) in known
+            if not word and j - i > 1:
+                continue
+            cost = (best[i][0] + (0 if word else 1), best[i][1] + 1)
+            if best[j] is None or cost < best[j]:
+                best[j], back[j] = cost, i
+    pieces: list[tuple[str, bool]] = []
+    j = n
+    while j:
+        i = back[j]
+        piece = "".join(syl[i:j])
+        pieces.append((piece, j - i > 1 or _key(piece) in known))
+        j = i
+    out: list[str] = []
+    prev_known = True
+    for piece, ok in reversed(pieces):
+        if out and not ok and not prev_known:
+            out[-1] += piece  # keep unknown syllables together
+        else:
+            out.append(piece)
+        prev_known = ok
+    return out
+
+
 def words(text: str) -> list[str]:
-    """Split on spaces/ZWSP, keeping the separator attached to the left word."""
+    """Split into pieces a line may break after: at spaces/ZWSP (kept with the
+    piece before them) and, inside Khmer text, between dictionary words."""
     out: list[str] = []
     cur = ""
-    for ch in text:
-        cur += ch
-        if ch in (" ", ZWSP):
-            out.append(cur)
+    for ch in text + "\0":
+        if ch in (" ", ZWSP, "\0"):
+            pieces = segment(cur) if cur else []
+            if ch != "\0":
+                if pieces:
+                    pieces[-1] += ch
+                else:
+                    pieces = [ch]
+            out += pieces
             cur = ""
-    if cur:
-        out.append(cur)
+        else:
+            cur += ch
     return out
 
 

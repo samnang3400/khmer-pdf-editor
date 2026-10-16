@@ -8,6 +8,7 @@ block_cipher = None
 datas = [
     ("khmerpdf/fonts", "khmerpdf/fonts"),
     ("khmerpdf/tessdata", "khmerpdf/tessdata"),   # OCR language data (khm, eng)
+    ("khmerpdf/data", "khmerpdf/data"),           # Khmer word list for line breaking
     ("assets/icon.ico", "assets"),
 ]
 # Tesseract OCR program, copied here by the build (see build-windows.yml)

@@ -9,7 +9,7 @@ when they write it. This one shapes Khmer correctly and keeps the text searchabl
 |---|---|---|
 | **Shaping**: subscript consonants (`្ត`), pre-base vowels (`េ ែ ៃ`), the coeng sign | Place characters one by one: visible `្`, broken stacks | Shapes every line with **HarfBuzz** before writing |
 | **Text layer**: shaped glyphs have no 1:1 Unicode value | Copy/search gives junk like `ĮĦអនÌរ` | Visible glyphs are drawn as **vector outlines** (not text). An **invisible Unicode layer** in a glyph-less font, the way OCR'd PDFs work, holds the real text |
-| **Line wrapping**: Khmer has no spaces between words | Wraps only at spaces, or mid-character | Wraps at spaces and zero-width spaces (ZWSP), with orthographic-syllable fallback |
+| **Line wrapping**: Khmer has no spaces between words | Wraps only at spaces, or mid-character | Wraps between words found with a Khmer dictionary (ICU's, as browsers use), at spaces and zero-width spaces (ZWSP), with a syllable fallback |
 | **Broken Khmer PDFs** (Word, older tools): text stored in visual order, lost subscripts, junk like `េសចក្តីបញចប់`, `ǒថប័ន` | Copy, search and editing give that junk | **Recovers the real text from the glyphs**: the PDF still holds the font's glyph IDs, so a HarfBuzz-built reverse dictionary for the same font (Khmer OS family bundled) turns them back into Unicode, checked against the embedded font's outlines first |
 | **Editing existing Khmer** | Often impossible | Click a line or paragraph and **edit it in place** on the page, in the document's own font; the old text is removed and the new text drawn on the same baseline |
 | **Legacy Limon fonts** | Show ASCII junk like `km<uCa` when copied | **Converts Limon text to Unicode** (`កម្ពុជា`) for editing, and can rewrite the whole document in a Unicode font |
@@ -55,7 +55,8 @@ Lines written by the app also store their own text, font, size and colour, so ed
   differences in glyph order between Word and HarfBuzz are tolerated. When no font matches, the text is
   rebuilt with Khmer spelling rules and marked as *please check* (orange border)
 - **Add Text**: drag a box (or click) and type in place; font, size and colour from the toolbar
-- **Word break** button inserts an invisible Khmer word break (ZWSP) where a line may wrap
+- **Word break** button inserts an invisible Khmer word break (ZWSP) where a line may wrap; usually not
+  needed, since text wraps between dictionary words anyway
 - **Find** Khmer or English across the document (Ctrl+F)
 - Undo/redo, Save / Save As (saves atomically: never leaves a half-written file)
 - Bundled fonts: the **Khmer OS** family (System, Battambang, Siemreap, Content, Muol…), Battambang
@@ -80,7 +81,8 @@ Code map:
 
 - `khmerpdf/engine.py`: shaping, PDF writing (visible + invisible layers), reading/editing lines
 - `khmerpdf/recover.py`: recovering real text from broken Khmer PDFs
-- `khmerpdf/linebreak.py`: Khmer-aware wrapping
+- `khmerpdf/linebreak.py`: Khmer-aware wrapping (dictionary word breaks)
+- `khmerpdf/pages.py`: page operations
 - `khmerpdf/legacy.py`: Limon → Unicode
 - `khmerpdf/ocr.py`: Tesseract OCR (hOCR) for scanned pages
 - `khmerpdf/app.py`, `khmerpdf/theme.py`: PySide6 GUI, colours and icons
@@ -108,8 +110,7 @@ and optionally adds KhmerPDF to *Open with* for PDFs without changing the defaul
 
 ## Known limitations / roadmap
 
-- **Next:** dictionary-based Khmer word segmentation, so wrapping works without ZWSP; other legacy
-  fonts (ABC, Baidok…); using OCR to check text rebuilt without its font
+- **Next:** other legacy fonts (ABC, Baidok…); using OCR to check text rebuilt without its font
 - **Phase 3:** form filling, signatures, annotations
 - Rotated pages are supported for adding text, but less tested than upright pages
 - Text that moves to make room is redrawn; if its font isn't available it is drawn in the toolbar's font
@@ -134,4 +135,4 @@ Bundled fonts: Battambang and Moul are SIL OFL 1.1 (`khmerpdf/fonts/OFL.txt`); t
 LGPL-2.1 (`khmerpdf/fonts/khmeros/COPYRIGHT-KhmerOS.txt`).
 The Limon character table in `khmerpdf/legacy.py` is derived from khmerconverter's `fontdata.xml`
 (Khmer OS project, LGPL-2.1). Tesseract OCR and its language data (`khmerpdf/tessdata`) are
-Apache-2.0.
+Apache-2.0. The Khmer word list (`khmerpdf/data`) is ICU's, under the Unicode License v3.
