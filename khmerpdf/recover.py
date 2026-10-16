@@ -305,17 +305,82 @@ def _shape_index(path: str) -> dict[tuple, tuple[int, ...]]:
 PREFER = {"\u178f": 0, "\u178a": 1}  # ត before ដ (subscripts ្ត / ្ដ)
 
 
+def _near(emb: hb.Font, ref: hb.Font, g: int, ops: tuple, ref_ops: tuple) -> bool:
+    """Glyph g looks the same in both fonts, give or take the small redrawing
+    between versions of a font (Khmer OS Muol 2007 vs today's): same advance,
+    nearly the same size and number of drawing steps. Marks may sit a little
+    to one side, so where a glyph starts doesn't count."""
+    if not ref_ops or emb.get_glyph_h_advance(g) * ref.face.upem != ref.get_glyph_h_advance(g) * emb.face.upem:
+        return False
+    a, b = emb.get_glyph_extents(g), ref.get_glyph_extents(g)
+    tol = 0.03 * emb.face.upem
+    return (abs(a.width - b.width) <= tol and abs(a.height - b.height) <= tol
+            and abs(len(ops) - len(ref_ops)) <= max(3, 0.15 * len(ref_ops)))
+
+
+@lru_cache(maxsize=None)
+def _variants(path: str) -> dict[int, tuple[int, ...]]:
+    """Mark glyph -> the same mark drawn at other heights/offsets (no advance,
+    same size and same number of drawing steps; only the position differs)."""
+    font = _ref_font(path)
+    groups: dict[tuple, list[int]] = {}
+    for gid in range(font.face.glyph_count):
+        if font.get_glyph_h_advance(gid):
+            continue
+        ops = _outlines(font, gid)
+        if not ops:
+            continue
+        e = font.get_glyph_extents(gid)
+        groups.setdefault((e.width, e.height, len(ops), tuple(o[0] for o in ops)), []).append(gid)
+    return {g: tuple(x for x in grp if x != g) for grp in groups.values() if len(grp) > 1 for g in grp}
+
+
+@lru_cache(maxsize=None)
+def _mark_shapes(path: str) -> list[tuple[int, int, int, int, tuple]]:
+    """(gid, y_bearing, width, height, drawing steps) of every mark glyph."""
+    font = _ref_font(path)
+    out = []
+    for gid in range(font.face.glyph_count):
+        if font.get_glyph_h_advance(gid):
+            continue
+        ops = _outlines(font, gid)
+        if ops:
+            e = font.get_glyph_extents(gid)
+            out.append((gid, e.y_bearing, e.width, e.height, tuple(o[0] for o in ops)))
+    return out
+
+
+def _like_marks(path: str, emb: hb.Font, g: int, ops: tuple) -> tuple[int, ...]:
+    """Reference marks drawn like the PDF's mark g (same steps, nearly the
+    same size), closest first - for a mark whose glyph ID differs between
+    font versions."""
+    e = emb.get_glyph_extents(g)
+    steps = tuple(o[0] for o in ops)
+    tol = 0.03 * emb.face.upem
+    hits = [(abs(w - e.width) + abs(h - e.height) + abs(y - e.y_bearing) / 10, gid)
+            for gid, y, w, h, st in _mark_shapes(path)
+            if st == steps and abs(w - e.width) <= tol and abs(h - e.height) <= tol]
+    return tuple(gid for _, gid in sorted(hits)[:4])
+
+
+SAME_FONT = 0.6  # this share of glyphs matching exactly by ID proves it is the same font
+
+
 def _glyph_map(emb: hb.Font, ref_path: str, gids: list[int], known_drawn: int = 0,
-               known_missing: int = 0) -> tuple[dict[int, tuple[int, ...]], int, int] | None:
+               known_missing: int = 0, named: bool = False) -> tuple[dict[int, tuple[int, ...]], int, int] | None:
     """Map the embedded font's glyph IDs to the reference font's, by outline.
     Works for subsets that keep the original IDs and for renumbered subsets.
     Returns (mapping, drawn, missing), or None unless (nearly) every drawn
     glyph is found in the reference font. `known_*` count glyphs checked on
-    earlier pages, so the bar applies to the whole font, not just new glyphs."""
+    earlier pages, so the bar applies to the whole font, not just new glyphs.
+    Slightly redrawn glyphs (another version of the font) count when the
+    glyph IDs prove it's the same font - or when the PDF names this font and
+    nearly every glyph has its metrics (`named`)."""
     index = _shape_index(ref_path)
     ref_font = _ref_font(ref_path)
     mapping: dict[int, tuple[int, ...]] = {}
-    drawn = missing = 0
+    near: dict[int, tuple[int, ...]] = {}  # same ID, slightly redrawn: kept if the IDs prove the font
+    drawn = missing = same = 0
     # can't reach 95% any more, however the remaining glyphs turn out
     give_up = 0.05 * (known_drawn + len(gids)) - known_missing
     for g in gids:
@@ -323,17 +388,28 @@ def _glyph_map(emb: hb.Font, ref_path: str, gids: list[int], known_drawn: int = 
         if not ops:
             continue  # blank glyphs (space, ZWSP) prove nothing
         drawn += 1
+        ref_ops = tuple(_outlines(ref_font, g)) if g < ref_font.face.glyph_count else ()
         # Same ID with the same outline wins: it tells look-alikes apart.
-        if g < ref_font.face.glyph_count and tuple(_outlines(ref_font, g)) == ops:
+        if ref_ops == ops:
             mapping[g] = (g,)
+            same += 1
             continue
         ref = index.get(ops)
-        if ref is None:
+        if ref is not None:
+            mapping[g] = ref
+        elif _near(emb, ref_font, g, ops, ref_ops):
+            near[g] = (g,)
+        elif emb.get_glyph_h_advance(g) == 0 and _like_marks(ref_path, emb, g, ops):
+            near[g] = _like_marks(ref_path, emb, g, ops)  # a mark whose ID moved between versions
+        else:
             missing += 1
             if missing > give_up:
                 return None
+    if near:
+        if same >= SAME_FONT * drawn or named and same + len(near) >= 0.9 * drawn:
+            mapping.update(near)
         else:
-            mapping[g] = ref
+            missing += len(near)
     total = known_drawn + drawn
     if not total or known_missing + missing > 0.05 * total:
         return None
@@ -344,9 +420,10 @@ class MappedDecoder:
     """A reference-font decoder plus the PDF-glyph -> reference-glyph mapping
     for one embedded font. The mapping grows as more pages are read."""
 
-    def __init__(self, path: str, emb: hb.Font):
+    def __init__(self, path: str, emb: hb.Font, named: bool = False):
         self.path = path
         self.emb = emb
+        self.named = named  # the PDF names this font (it may be another version of it)
         self.mapping: dict[int, tuple[int, ...]] = {}
         self.same_ids = True
         self.drawn = self.missing = 0
@@ -359,7 +436,7 @@ class MappedDecoder:
         if not any(_outlines(self.emb, g) for g in new):
             m = {}
         else:
-            res = _glyph_map(self.emb, self.path, new, self.drawn, self.missing)
+            res = _glyph_map(self.emb, self.path, new, self.drawn, self.missing, self.named)
             if res is None:
                 return False
             m, drawn, missing = res
@@ -378,6 +455,15 @@ class MappedDecoder:
                                  if g not in self.mapping and g < n and not _outlines(self.emb, g)})
         return True
 
+    def _with_variants(self, cands: tuple[int, ...]) -> tuple[int, ...]:
+        """Add, as last resorts, glyphs that are the same mark at another
+        height or offset: fonts differ in which positional variant a shaper
+        picks (Word 2007's Muol uses ើ's 'base' form where HarfBuzz uses '.h')."""
+        out = list(cands)
+        for r in cands:
+            out += [v for v in _variants(self.path).get(r, ()) if v not in out]
+        return tuple(out)
+
     @cached_property
     def dec(self) -> "GlyphDecoder":
         # built on first use: it takes about a second, and most candidate
@@ -390,7 +476,13 @@ class MappedDecoder:
         return (PREFER.get(t[-1:], 1) if t else 2, g)
 
     def decode_scored(self, tokens: list[tuple[int, str]]) -> tuple[str, float]:
-        return self.dec.decode_scored([(self.mapping.get(g, ()) if g >= 0 else (), t) for g, t in tokens])
+        text, misses = self.dec.decode_scored([(self.mapping.get(g, ()) if g >= 0 else (), t) for g, t in tokens])
+        if misses:  # last resort: marks drawn at another height (font versions differ)
+            alt = self.dec.decode_scored([(self._with_variants(self.mapping.get(g, ())) if g >= 0 else (), t)
+                                          for g, t in tokens])
+            if alt[1] < misses:
+                return alt
+        return text, misses
 
 
 def _identify(doc: pymupdf.Document, xref: int, preferred: str | None, gids: list[int]) -> MappedDecoder | None:
@@ -405,7 +497,7 @@ def _identify(doc: pymupdf.Document, xref: int, preferred: str | None, gids: lis
     emb = hb.Font(hb.Face(buf))
     candidates = list(dict.fromkeys(([preferred] if preferred else []) + list(reference_fonts().values())))
     for path in candidates:
-        md = MappedDecoder(path, emb)
+        md = MappedDecoder(path, emb, named=path == preferred)
         if md.extend(gids) and md.drawn:
             return md
     return None
@@ -502,13 +594,50 @@ def _visual_order(glyphs: list) -> list:
     clusters: list[list] = []
     for g in glyphs:
         mark = _is_mark(ord(g[4][0]) if g[4] else 0, g[2], g[5])
-        if clusters and g[0] < clusters[-1][0][0] - 0.01:  # drawn left of the syllable: pre-base
-            clusters[-1].insert(0, g)
-        elif clusters and mark:
+        if clusters and mark and g[2][2] - g[2][0] < 0.05 * g[5]:
+            # A vowel sign or subscript (drawn with no width of its own)
+            # belongs to the letter it is anchored at
+            # the end of. Usually that's the syllable just drawn, but Word draws
+            # a word's letters first and its marks afterwards, or a subscript
+            # after the next letter - so go by position, not by order.
+            letters = [c for c in clusters if not _blank(c[0]) and min(q[2][0] for q in c) < g[0] + 0.01]
+            home = min(reversed(letters), key=lambda c: abs(max(q[2][2] for q in c) - g[0]),
+                       default=clusters[-1])
+            if _subscript(g):  # subscripts come right after their letter, before its vowels
+                at = next((i for i, q in enumerate(home) if i and q[2][2] - q[2][0] < 0.05 * q[5]
+                           and not _subscript(q)), len(home))
+                home.insert(at, g)
+            else:
+                home.append(g)
+        elif (clusters and not _blank(clusters[-1][0])
+              and clusters[-1][0][0] - 1.5 * g[5] < g[0] < clusters[-1][0][0] - 0.01):
+            clusters[-1].insert(0, g)  # drawn just left of the syllable: pre-base (េ, ្រ)
+        elif clusters and mark and not _blank(clusters[-1][0]):
             clusters[-1].append(g)
         else:
             clusters.append([g])
-    return [g for c in clusters for g in c]
+    # a letter drawn out of turn (Word sometimes draws a line's first letter
+    # last) goes back to its place; everything else keeps its order
+    placed: list[list] = []
+    for c in clusters:
+        x = min(q[0] for q in c)
+        if placed and x < min(q[0] for q in placed[-1]) - 1.5 * c[0][5]:
+            at = next((i for i, d in enumerate(placed) if min(q[0] for q in d) > x), len(placed))
+            placed.insert(at, c)
+        else:
+            placed.append(c)
+    return [g for c in placed for g in c]
+
+
+def _blank(g) -> bool:
+    """A space or word break: it starts no syllable and takes no marks."""
+    return not g[4].strip(" \u200b\xa0")
+
+
+def _subscript(g) -> bool:
+    """A subscript consonant glyph (or the COENG sign), drawn with no width."""
+    t = g[4][:1]
+    return t == "\u17d2" or ("\u1780" <= t <= "\u17a2" and g[2][2] - g[2][0] < 0.05 * g[5])
 
 
 SPLIT_GAP_EM = 3.0  # a horizontal jump bigger than this starts a new line segment
@@ -589,6 +718,33 @@ def _find_rules(page: pymupdf.Page) -> Rules:
     return Rules(h, v)
 
 
+ZWSP_GAP_EM = 0.15  # a "space" that leaves less of a gap than this is an invisible word break
+
+
+def _invisible_spaces(gl: list) -> list:
+    """Word (and Khmer OS's own documents) separate Khmer words with ZERO WIDTH
+    SPACE; Distiller writes it as the font's space glyph and pulls the next
+    letters back over it, and the text layer says " ". Judge by the page:
+    a space that leaves no visible gap becomes U+200B again."""
+    boxes = sorted((g[2][0], g[2][2]) for g in gl if g[4].strip())
+    if not boxes:
+        return gl
+    out, spaces = [], []
+    for g in gl:
+        if g[4] == " ":
+            x, eps = g[0], 0.05 * g[5]
+            left = max((b for a, b in boxes if b <= x + eps), default=None)   # where the text before ends
+            right = min((a for a, b in boxes if a >= x - eps), default=None)  # where the text after starts
+            gap = right - left if left is not None and right is not None else ZWSP_GAP_EM * g[5]
+            # Distiller also writes "space, then word break" at one spot: one space is enough
+            if gap < ZWSP_GAP_EM * g[5] or any(abs(x - s) < eps for s in spaces):
+                g = g[:3] + (-1, "\u200b") + g[5:]  # not decodable: keep the word break as it is
+            else:
+                spaces.append(x)
+        out.append(g)
+    return out
+
+
 COLUMN_GAP_EM = 1.0  # gaps at least this wide may be a table's column gutter
 COLUMN_ROWS = 3      # ...when this many nearby lines have one in the same place
 
@@ -655,8 +811,9 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = (),
     rules = rules if rules is not None else page_rules(page)
     decs = page_decoders(page)
     glyphs = []  # (x, y, bbox, gid, text, size, font, color, decoder)
+    seen: set[tuple] = set()  # Word draws bold text twice (fill, then outline) in the same place
     for sp in page.get_texttrace():
-        if sp["font"] in skip_fonts:
+        if sp["font"] in skip_fonts or sp.get("type") == 3:
             continue
         dec = decs.get(_norm(sp["font"]))
         col = tuple(sp["color"])[:3] if len(sp["color"]) >= 3 else (sp["color"][0],) * 3
@@ -666,6 +823,10 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = (),
                 g = glyphs[-1]
                 glyphs[-1] = g[:4] + (g[4] + uni,) + g[5:]
                 continue
+            key = (c[1], c[0], round(c[2][0] * 4), round(c[2][1] * 4), sp["font"])
+            if key in seen:
+                continue
+            seen.add(key)
             glyphs.append((c[2][0], c[2][1], c[3], c[1], uni, sp["size"], sp["font"], col, dec))
     if not glyphs:
         return []
@@ -702,6 +863,8 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = (),
         seg["x1"] = max(seg["x1"], bbox[2])
 
     segments = _split_columns(segments)
+    for seg in segments:
+        seg["glyphs"] = _invisible_spaces(seg["glyphs"])
 
     # 3. decode each segment
     out: list[FoundLine] = []

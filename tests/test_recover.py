@@ -185,3 +185,60 @@ def test_reverse_dictionary_is_cached_on_disk(tmp_path, monkeypatch):
     monkeypatch.setenv("KHMERPDF_CACHE", str(tmp_path))
     again = recover.GlyphDecoder(path)
     assert again.seq == built.seq
+
+
+# ---- Word/Distiller PDFs: word breaks, bold, late marks, older font versions ----
+def _g(x, text, gid, w, size=8.0, font="KhmerOSmc"):
+    """A glyph as find_lines collects it: (x, y, bbox, gid, text, size, font, color, decoder)."""
+    return (x, 40.0, (x, 32.0, x + w, 42.0), gid, text, size, font, (0, 0, 0), None)
+
+
+def test_space_that_leaves_no_gap_is_a_word_break():
+    from khmerpdf.recover import _invisible_spaces
+    gl = [_g(70.0, "ក", 562, 6.0), _g(76.0, " ", 1, 3.2), _g(76.0, "ខ", 563, 6.0),      # no gap: ZWSP
+          _g(82.0, " ", 1, 3.2), _g(86.0, "គ", 564, 6.0),                               # a real space
+          _g(92.0, " ", 1, 3.2), _g(92.0, " ", 1, 3.2), _g(96.0, "ឃ", 565, 6.0)]        # space + ZWSP
+    texts = [g[4] for g in _invisible_spaces(gl)]
+    assert texts == ["ក", "​", "ខ", " ", "គ", " ", "​", "ឃ"]
+
+
+def test_marks_drawn_after_the_word_go_back_to_their_letters():
+    """Word draws a word's letters, then its vowels and subscripts (the header
+    of Khmer OS's own typing guide: យូនីកូដខ្មែរ)."""
+    from khmerpdf.recover import _visual_order
+    drawn = [_g(108.3, "យ", 587, 9.4), _g(117.7, "ន", 581, 6.2), _g(123.9, "ក", 562, 6.2), _g(130.1, "ដ", 572, 6.3),
+             _g(136.4, "​", -1, 3.1), _g(136.4, "ែ", 628, 3.1), _g(139.5, "ខ", 563, 6.0), _g(145.5, "រ", 588, 6.1),
+             _g(116.9, "ូ", 622, 0), _g(129.7, "ូ", 622, 0), _g(145.9, "ម", 407, 0), _g(123.9, "ី", 618, 0)]
+    order = [g[4] for g in _visual_order(drawn)]
+    assert order == ["យ", "ូ", "ន", "ី", "ក", "ូ", "ដ", "​", "ែ", "ខ", "ម", "រ"]
+
+
+def test_bold_drawn_twice_is_read_once():
+    doc = pymupdf.open()
+    page = doc.new_page()
+    css = "@font-face{font-family:K;src:url(KhmerOSbattambang.ttf);} body{font-family:K;font-size:13px}"
+    for _ in range(2):  # Word's bold: the same text filled, then outlined, in the same place
+        page.insert_htmlbox(pymupdf.Rect(40, 60, 560, 95), LINES[1], css=css, archive=pymupdf.Archive(str(KHMER_OS)))
+    page = pymupdf.open(stream=doc.tobytes())[0]
+    assert [ln.text for ln in text_lines(page)] == [LINES[1]]
+
+
+def test_slightly_redrawn_font_version_still_decodes(tmp_path):
+    """A PDF made with another version of a font (some marks redrawn a little)
+    is still recognised by glyph IDs and metrics."""
+    from fontTools.ttLib import TTFont
+    f = TTFont(str(KHMER_OS / "KhmerOSmuol.ttf"))
+    glyf = f["glyf"]
+    for name in ("uni17b8", "uni17b7", "uni17c6"):  # ី ិ ំ: nudge a point, like a redraw
+        g = glyf[name]
+        coords = g.getCoordinates(glyf)[0]
+        coords[0] = (coords[0][0] + 12, coords[0][1] + 9)
+    f.save(str(tmp_path / "KhmerOSmuol.ttf"))
+    words = ["ជំពូកទី២", "សេចក្ដីផ្ដើម", "ពិសេស"]
+    doc = pymupdf.open()
+    page = doc.new_page()
+    css = "@font-face{font-family:K;src:url(KhmerOSmuol.ttf);} body{font-family:K;font-size:16px}"
+    page.insert_htmlbox(pymupdf.Rect(40, 60, 560, 400), "<br>".join(words), css=css,
+                        archive=pymupdf.Archive(str(tmp_path)))
+    page = pymupdf.open(stream=doc.tobytes())[0]
+    assert [ln.text for ln in text_lines(page)] == words
