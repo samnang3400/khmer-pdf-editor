@@ -19,7 +19,10 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QColorDialog, QC
                                QToolBar, QToolButton, QVBoxLayout, QWidget)
 
 from . import __version__, ocr
+from . import annots as AN
+from . import forms as F
 from . import pages as P
+from .annots import Annot
 from .recover import page_rules
 from . import theme as T
 from .engine import (Paragraph, Picture, TextLine, add_ocr_layer, bundled_fonts, convert_legacy,
@@ -46,7 +49,7 @@ IMAGE_FILES = "Images (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff)"
 def block_rect(para) -> pymupdf.Rect:
     """The paragraph's box: its wrap width, and the height of its lines.
     (A picture's box is just its rectangle.)"""
-    if isinstance(para, Picture):
+    if isinstance(para, (Picture, Annot)):
         return pymupdf.Rect(para.rect)
     r = para.rect
     return pymupdf.Rect(min(para.x, r.x0), r.y0, max(para.x + para.width, r.x1), r.y1)
@@ -91,6 +94,7 @@ class InlineEditor(QPlainTextEdit):
         super().__init__(parent)
         self.wrap_width = wrap_width  # px; None = single line that grows to the right
         self.min_width = 60.0         # px; at least the width of the text being covered
+        self.min_height = 0.0         # px; a form field's editor covers the whole field
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setLineWrapMode(QPlainTextEdit.WidgetWidth if wrap_width else QPlainTextEdit.NoWrap)
@@ -130,7 +134,7 @@ class InlineEditor(QPlainTextEdit):
             lines = self.toPlainText().split("\n")
             w = max(fm.horizontalAdvance(t) for t in lines) + fm.averageCharWidth() * 3 + pad
             h = len(lines) * fm.lineSpacing() + pad
-        self.resize(int(max(w, self.min_width)), int(h))
+        self.resize(int(max(w, self.min_width)), int(max(h, self.min_height)))
 
 
 class EditorGrip(QLabel):
@@ -182,6 +186,10 @@ class PageCanvas(QWidget):
     move_requested = Signal(object, float, float)       # paragraph, dx, dy (page units)
     resize_requested = Signal(object, object, bool)     # paragraph, new box (page), corner (= scale)
     edit_requested = Signal(object)      # double click on a paragraph
+    field_clicked = Signal(object)       # a form field (View and Edit tools)
+    highlight_drawn = Signal(object)     # pymupdf.Rect (Highlight tool)
+    point_clicked = Signal(object)       # pymupdf.Point (Note tool, placing a signature)
+    context_requested = Signal(object, object)  # global QPoint, pymupdf.Point (right click)
 
     def __init__(self, theme: T.Theme):
         super().__init__()
@@ -194,14 +202,17 @@ class PageCanvas(QWidget):
         self.lines: list[TextLine] = []
         self.paras: list[Paragraph] = []
         self.pics: list[Picture] = []
-        self.hover: Paragraph | Picture | None = None
-        self.selected: Paragraph | Picture | None = None
+        self.annots: list[Annot] = []
+        self.fields: list[F.Field] = []
+        self.hover = None      # paragraph, picture, annotation or form field under the mouse
+        self.selected = None   # (Select tool)
         self.highlights: list[pymupdf.Rect] = []
         self._drag: dict | None = None
 
     def set_page(self, pixmap: QPixmap, scale: float, lines: list[TextLine], paras: list[Paragraph],
-                 pics: list[Picture] = ()):
+                 pics: list[Picture] = (), annots: list[Annot] = (), fields: list[F.Field] = ()):
         self.pixmap, self.scale, self.lines, self.paras, self.pics = pixmap, scale, lines, paras, list(pics)
+        self.annots, self.fields = list(annots), list(fields)
         self.hover = None
         self.selected = None
         self._drag = None
@@ -224,17 +235,26 @@ class PageCanvas(QWidget):
                "l": QPointF(r.left(), r.center().y()), "r": QPointF(r.right(), r.center().y())}
         return {k: QRectF(p.x() - 4, p.y() - 4, 8, 8) for k, p in pts.items()}
 
-    def hit(self, pos) -> Paragraph | Picture | None:
-        """Text under the mouse - or, with the Select tool, a picture (the one
-        drawn last, i.e. on top)."""
+    def hit(self, pos):
+        """Text under the mouse - or, with the Select tool, also a note, a
+        picture (the one on top) or a highlight."""
         pt = self._to_page(pos)
+        if self.mode == "select":
+            note = next((a for a in reversed(self.annots) if a.movable and pt in a.rect), None)
+            if note:
+                return note
         para = next((p for p in self.paras if pt in block_rect(p)), None)
         if para is None and self.mode == "select":
-            para = next((p for p in reversed(self.pics) if pt in p.rect), None)
+            para = (next((p for p in reversed(self.pics) if pt in p.rect), None)
+                    or next((a for a in reversed(self.annots) if pt in a.rect), None))
         return para
 
+    def field_at(self, pos) -> F.Field | None:
+        pt = self._to_page(pos)
+        return next((f for f in self.fields if pt in f.rect and f.kind != "button"), None)
+
     def _handle_at(self, pos: QPointF) -> str | None:
-        if not self.selected:
+        if not self.selected or isinstance(self.selected, Annot):
             return None
         return next((k for k, h in self._handles(self._box(self.selected)).items()
                      if h.adjusted(-4, -4, 4, 4).contains(pos)), None)
@@ -256,6 +276,13 @@ class PageCanvas(QWidget):
             c.setAlpha(a)
             return c
 
+        if self.fields and self.mode not in ("add", "highlight"):
+            for f in self.fields:  # form fields: a light tint, like other PDF viewers
+                hot = f is self.hover
+                p.setPen(QPen(tint(accent, 200 if hot else 90), 1))
+                p.setBrush(tint(accent, 45 if hot else 22))
+                p.drawRect(self._to_screen(f.rect))
+            p.setBrush(Qt.NoBrush)
         if self.mode in ("edit", "select"):
             for para in self.paras:
                 col = warn if para.needs_check else accent
@@ -263,8 +290,8 @@ class PageCanvas(QWidget):
                 p.drawRoundedRect(self._box(para), 3, 3)
             if self.mode == "select":
                 p.setPen(QPen(tint(QColor(t.muted), 110), 1, Qt.DotLine))
-                for pic in self.pics:
-                    p.drawRect(self._box(pic))
+                for item in self.pics + [a for a in self.annots if a.movable]:
+                    p.drawRect(self._box(item))
             if self.hover and self.hover is not self.selected:
                 col = warn if getattr(self.hover, "needs_check", False) else accent
                 p.setPen(QPen(col, 1.5))
@@ -288,11 +315,12 @@ class PageCanvas(QWidget):
                 box = d["rect"]
             p.setPen(QPen(accent, 1.5))
             p.drawRoundedRect(box, 3, 3)
-            p.setBrush(QColor("white"))  # handles sit on the (white) page in both themes
-            for h in self._handles(box).values():
-                p.drawRoundedRect(h, 2, 2)
-            p.setBrush(Qt.NoBrush)
-        if self.mode == "add" and self._drag:
+            if not isinstance(self.selected, Annot):
+                p.setBrush(QColor("white"))  # handles sit on the (white) page in both themes
+                for h in self._handles(box).values():
+                    p.drawRoundedRect(h, 2, 2)
+                p.setBrush(Qt.NoBrush)
+        if self.mode in ("add", "highlight") and self._drag:
             r = self._drag["rect"]
             p.setPen(QPen(accent, 1.5, Qt.DashLine))
             p.fillRect(r, tint(accent, 30))
@@ -300,12 +328,20 @@ class PageCanvas(QWidget):
 
     # ---- mouse ----------------------------------------------------------
     def mousePressEvent(self, e):
+        if e.button() == Qt.RightButton:
+            self.pressed.emit()
+            self.context_requested.emit(e.globalPosition().toPoint(), self._to_page(e.position()))
+            return
         if e.button() != Qt.LeftButton:
             return
         self.pressed.emit()  # may save an open editor and re-render the page
         pos = e.position()
-        if self.mode == "add":
-            self._drag = dict(kind="add", start=pos, rect=QRectF(pos, QSize(0, 0)))
+        if self.mode in ("view", "edit") and self.field_at(pos):
+            self.field_clicked.emit(self.field_at(pos))
+        elif self.mode in ("add", "highlight"):
+            self._drag = dict(kind=self.mode, start=pos, rect=QRectF(pos, QSize(0, 0)))
+        elif self.mode in ("note", "place"):
+            self.point_clicked.emit(self._to_page(pos))
         elif self.mode == "edit":
             para = self.hit(pos)  # fresh hit-test: the page may have just changed
             if para:
@@ -320,7 +356,7 @@ class PageCanvas(QWidget):
             if para is not self.selected:
                 self.selected = para
                 self.selection_changed.emit(para)
-            if para:
+            if para and getattr(para, "movable", True):
                 box = self._box(para)
                 self._drag = dict(kind="move", start=pos, orig=box, rect=QRectF(box))
             self.update()
@@ -351,7 +387,7 @@ class PageCanvas(QWidget):
     def mouseMoveEvent(self, e):
         pos = e.position()
         d = self._drag
-        if d and self.mode == "add":
+        if d and self.mode in ("add", "highlight"):
             d["rect"] = QRectF(d["start"], pos).normalized()
             self.update()
             return
@@ -362,6 +398,15 @@ class PageCanvas(QWidget):
             d["rect"] = self._drag_rect(d, pos)
             self.update()
             return
+        if self.mode in ("view", "edit") and self.fields:
+            f = self.field_at(pos)
+            if f or isinstance(self.hover, F.Field):
+                self.setCursor(Qt.PointingHandCursor if f else Qt.ArrowCursor)
+                if f is not self.hover:
+                    self.hover = f
+                    self.update()
+                if f:
+                    return
         if self.mode in ("edit", "select"):
             hit = self.hit(pos)
             handle = self._handle_at(pos) if self.mode == "select" else None
@@ -380,6 +425,18 @@ class PageCanvas(QWidget):
         if not d:
             return
         self.update()
+        if self.mode == "highlight":
+            r = d["rect"]
+            s = self.scale
+            if r.width() < 6 and r.height() < 6:  # a click: the line under it
+                pt = self._to_page(r.center())
+                line = next((ln for ln in self.lines if pt in ln.rect), None)
+                if line is None:
+                    return
+                self.highlight_drawn.emit(pymupdf.Rect(line.rect))
+            else:
+                self.highlight_drawn.emit(pymupdf.Rect(r.left() / s, r.top() / s, r.right() / s, r.bottom() / s))
+            return
         if self.mode == "add":
             r = d["rect"]
             x0, y0 = r.left() / self.scale, r.top() / self.scale
@@ -585,13 +642,143 @@ class Banner(QFrame):
         self.setProperty("kind", "warning" if warning else "info")
         self.style().unpolish(self)
         self.style().polish(self)
-        name = {"scan": "ocr", "limon": "convert"}.get(kind, "edit")
+        name = {"scan": "ocr", "limon": "convert", "form": "edit"}.get(kind, "edit")
         self.icon.setPixmap(T.icon_pixmap(name, t.warning if warning else t.accent))
         self.text.setText(text)
         self.action.setVisible(bool(action))
         self.action.setText(action or "")
         self.close_btn.setIcon(T.icon("close", t))
         self.show()
+
+
+# --------------------------------------------------------------------------
+# Signature: draw it once (kept for next time) or use a picture of it
+# --------------------------------------------------------------------------
+def signature_file() -> Path:
+    from PySide6.QtCore import QStandardPaths
+    return Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)) / "signature.png"
+
+
+class SignaturePad(QWidget):
+    """Draw with the mouse or a pen."""
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(520, 190)
+        self.setCursor(Qt.CrossCursor)
+        self.strokes: list[list[QPointF]] = []
+
+    def clear(self):
+        self.strokes = []
+        self.update()
+
+    def mousePressEvent(self, e):
+        self.strokes.append([e.position()])
+
+    def mouseMoveEvent(self, e):
+        if self.strokes and e.buttons() & Qt.LeftButton:
+            self.strokes[-1].append(e.position())
+            self.update()
+
+    def _draw(self, p: QPainter, width: float):
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(QColor(20, 40, 110), width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        for stroke in self.strokes:
+            if len(stroke) == 1:
+                p.drawPoint(stroke[0])
+            for a, b in zip(stroke, stroke[1:]):
+                p.drawLine(a, b)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("white"))
+        p.setPen(QPen(QColor(200, 205, 212), 1, Qt.DashLine))
+        p.drawLine(24, self.height() - 40, self.width() - 24, self.height() - 40)  # the line to sign on
+        self._draw(p, 2.6)
+
+    def png(self) -> bytes | None:
+        """The signature, cropped, on a transparent background (3x for print)."""
+        pts = [q for s in self.strokes for q in s]
+        if not pts:
+            return None
+        from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+        x0, y0 = min(q.x() for q in pts) - 6, min(q.y() for q in pts) - 6
+        x1, y1 = max(q.x() for q in pts) + 6, max(q.y() for q in pts) + 6
+        k = 3
+        img = QImage(int((x1 - x0) * k), int((y1 - y0) * k), QImage.Format_ARGB32)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        p.scale(k, k)
+        p.translate(-x0, -y0)
+        self._draw(p, 2.6)
+        p.end()
+        data = QByteArray()
+        buf = QBuffer(data)
+        buf.open(QIODevice.WriteOnly)
+        img.save(buf, "PNG")
+        return bytes(data)
+
+
+class SignatureDialog(QDialog):
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setWindowTitle("Signature")
+        self.result_png: bytes | None = None
+        lay = QVBoxLayout(self)
+        saved = signature_file()
+        if saved.is_file():
+            row = QHBoxLayout()
+            prev = QLabel()
+            pm = QPixmap(str(saved))
+            prev.setPixmap(pm.scaledToHeight(60, Qt.SmoothTransformation) if pm.height() > 60 else pm)
+            prev.setStyleSheet("background: white; border: 1px solid #ccc; padding: 4px;")
+            row.addWidget(prev)
+            use = QPushButton("Use this signature", objectName="primary")
+            use.clicked.connect(lambda: self._done(saved.read_bytes(), remember=False))
+            row.addWidget(use)
+            row.addStretch(1)
+            lay.addLayout(row)
+            lay.addWidget(QLabel("…or draw a new one:", objectName="muted"))
+        else:
+            lay.addWidget(QLabel("Draw your signature below. It is kept for next time.", objectName="muted"))
+        self.pad = SignaturePad()
+        lay.addWidget(self.pad)
+        row = QHBoxLayout()
+        clear = QPushButton("Clear")
+        clear.clicked.connect(self.pad.clear)
+        pick = QPushButton("Use a picture file…")
+        pick.clicked.connect(self._pick)
+        row.addWidget(clear)
+        row.addWidget(pick)
+        row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("Use drawing", objectName="primary" if not saved.is_file() else "")
+        ok.clicked.connect(lambda: self._done(self.pad.png(), remember=True))
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        lay.addLayout(row)
+        note = QLabel("This places a picture of your signature on the page. It is not a digital "
+                      "(certificate) signature.", objectName="hint", wordWrap=True)
+        lay.addWidget(note)
+
+    def _pick(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Signature picture", "", IMAGE_FILES)
+        if path:
+            self._done(Path(path).read_bytes(), remember=True)
+
+    def _done(self, png: bytes | None, remember: bool):
+        if not png:
+            QMessageBox.information(self, APP_NAME, "Draw your signature first.")
+            return
+        if remember:
+            try:
+                signature_file().parent.mkdir(parents=True, exist_ok=True)
+                signature_file().write_bytes(png)
+            except OSError:
+                pass
+        self.result_png = png
+        self.accept()
 
 
 # --------------------------------------------------------------------------
@@ -628,6 +815,11 @@ class MainWindow(QMainWindow):
         self.canvas.move_requested.connect(self.move_item)
         self.canvas.resize_requested.connect(self.resize_item)
         self.canvas.edit_requested.connect(self._edit_from_select)
+        self.canvas.field_clicked.connect(self.fill_field)
+        self.canvas.highlight_drawn.connect(self.add_highlight)
+        self.canvas.point_clicked.connect(self._point_clicked)
+        self.canvas.context_requested.connect(self._context_menu)
+        self._signature: bytes | None = None  # waiting to be placed
 
         self.scroll = QScrollArea(objectName="pages")
         self.scroll.setWidget(PageFrame(self.canvas))
@@ -733,13 +925,18 @@ class MainWindow(QMainWindow):
                 ("view", "View", "view", "Esc", "Browse the document"),
                 ("select", "Select", "select", "V", "Select text to move, resize (drag the handles) or delete it"),
                 ("edit", "Edit Text", "edit", "E", "Click a paragraph or line to edit it in place"),
-                ("add", "Add Text", "add", "T", "Drag a box (or click) to add Khmer text")):
+                ("add", "Add Text", "add", "T", "Drag a box (or click) to add Khmer text"),
+                ("highlight", "Highlight", "highlight", "H", "Drag over text to highlight it"),
+                ("note", "Note", "note", "N", "Click to add a comment note")):
             a = self._act(label, lambda _=False, m=mode: self.set_mode(m), icon, key, tip, tb, checkable=True)
             group.addAction(a)
             self.mode_actions[mode] = a
             btn = tb.widgetForAction(a)
-            btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            if mode not in ("highlight", "note"):  # (icons only: the toolbar is full)
+                btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.mode_actions["view"].setChecked(True)
+        self.sign_act = self._act("Sign…", self.sign, "sign", "Ctrl+Shift+S",
+                                  "Place your signature (draw it once, or use a picture of it)", tb)
         self.delete_act = self._act("Delete", self.delete_selection, "delete", QKeySequence.Delete,
                                     "Delete the selected text", tb)
         self.delete_act.setEnabled(False)
@@ -925,8 +1122,8 @@ class MainWindow(QMainWindow):
         menu("&View", [self.sidebar_act, None, self.zoom_in_act, self.zoom_out_act, self.zoom_100_act,
                        self.fit_act])
         self.pages_menu = menu("&Pages", self.page_acts)
-        menu("&Tools", [*self.mode_actions.values(), None, self.insert_zwsp_act, None, self.ocr_act,
-                        self.ocr_all_act, self.limon_act])
+        menu("&Tools", [*self.mode_actions.values(), None, self.sign_act, self.insert_zwsp_act, None,
+                        self.ocr_act, self.ocr_all_act, self.limon_act])
         menu("&Help", [self.about_act])
 
     def _fill_recent_menu(self):
@@ -1170,7 +1367,7 @@ class MainWindow(QMainWindow):
 
     def _doc_controls(self, on: bool):
         for a in (self.save_act, self.save_as_act, self.ocr_act, self.ocr_all_act, self.limon_act,
-                  self.print_act, self.preview_act, *self.mode_actions.values(),
+                  self.print_act, self.preview_act, self.sign_act, *self.mode_actions.values(),
                   *[x for x in getattr(self, "page_acts", []) if x]):
             a.setEnabled(on)
         for w in self._nav + self._nav_gaps:
@@ -1219,22 +1416,30 @@ class MainWindow(QMainWindow):
         self._style_inline()
 
     HINTS = {"view": "", "select": "Drag to move · handles resize · Delete removes · double-click edits",
-             "edit": "Click text to edit it in place", "add": "Drag a box (or click) and type"}
+             "edit": "Click text to edit it in place", "add": "Drag a box (or click) and type",
+             "highlight": "Drag over text (or click a line) to highlight it", "note": "Click where the note goes",
+             "place": "Click where your signature goes · Esc cancels"}
 
     def set_mode(self, mode: str):
         self._close_inline(save=True)
-        self.mode_actions[mode].setChecked(True)
+        if mode != "place":
+            self._signature = None
+            self.mode_actions[mode].setChecked(True)
         self.canvas.mode = mode
         self.canvas.hover = None
         if mode != "select" and self.canvas.selected:
             self.canvas.selected = None
             self._selection_changed(None)
-        self.canvas.setCursor(Qt.CrossCursor if mode == "add" else Qt.ArrowCursor)
+        self.canvas.setCursor(Qt.CrossCursor if mode in ("add", "highlight", "note", "place") else Qt.ArrowCursor)
         self.tool_hint.setText(self.HINTS[mode])
         hints = {"view": "", "select": "Click text to select it. Drag it to move it; drag a side handle to change "
                                        "its width, a corner to make it bigger or smaller.",
                  "add": "Drag a box (or click) and type. Enter = save, Shift+Enter = new line.",
-                 "edit": "Click a paragraph or line to edit it in place."}
+                 "edit": "Click a paragraph or line to edit it in place.",
+                 "highlight": "Drag over the text to highlight, or click a line. Right-click a highlight to "
+                              "remove it.",
+                 "note": "Click where the note should go, then type your comment.",
+                 "place": "Click on the page where your signature should go (Esc cancels)."}
         self.statusBar().showMessage(hints[mode])
         self.canvas.update()
 
@@ -1310,7 +1515,8 @@ class MainWindow(QMainWindow):
         self.canvas.highlights = [r for n, r in self.search_hits if n == self.page_no]
         rules = page_rules(page)  # table borders keep cells apart
         lines = text_lines(page, rules)
-        self.canvas.set_page(qpix, scale, lines, paragraphs(lines, rules=rules), pictures(page, lines))
+        self.canvas.set_page(qpix, scale, lines, paragraphs(lines, rules=rules), pictures(page, lines),
+                             AN.annotations(page), F.fields(page))
         if key and self.canvas.mode == "select":
             self.canvas.selected = next((p for p in self.canvas.paras + self.canvas.pics
                                          if self._key(p)[0] == key[0] and abs(self._key(p)[1] - key[1]) < 2
@@ -1403,7 +1609,10 @@ class MainWindow(QMainWindow):
     def _update_banner(self, page: pymupdf.Page | None = None):
         page = page or self.doc[self.page_no]
         t = self.theme
-        if "scan" not in self._dismissed and not any(ln.ocr for ln in self.canvas.lines) and ocr.is_scanned(page):
+        if "form" not in self._dismissed and any(f.kind != "button" for f in self.canvas.fields):
+            self.banner.show_message("form", "This page has a form. Click a field to fill it in - Khmer is "
+                                     "shaped correctly in the saved PDF.", None, None, False, t)
+        elif "scan" not in self._dismissed and not any(ln.ocr for ln in self.canvas.lines) and ocr.is_scanned(page):
             self.banner.show_message("scan", "This page is a scanned image. Recognize its text to search, copy "
                                      "and edit it.", "Recognize Text", self.ocr_page, False, t)
         elif "limon" not in self._dismissed and any(ln.legacy for ln in self.canvas.lines):
@@ -1439,6 +1648,8 @@ class MainWindow(QMainWindow):
         """Finds the same paragraph or picture again after the page is redrawn."""
         if isinstance(item, Picture):
             return "pic", item.rect.x0, item.rect.y0
+        if isinstance(item, Annot):
+            return "annot", item.rect.x0, item.rect.y0
         return "text", item.x, item.first.baseline
 
     def _font_for(self, pdf_font: str) -> str:
@@ -1451,6 +1662,9 @@ class MainWindow(QMainWindow):
             r = para.rect
             self.statusBar().showMessage(f"Picture selected · {r.width:.0f} × {r.height:.0f} pt · drag to move, "
                                          "handles resize, double-click to replace")
+        elif isinstance(para, Annot):
+            self.statusBar().showMessage("Note selected · drag to move, double-click to edit, Delete removes"
+                                         if para.movable else "Highlight selected · Delete removes it")
         elif para is not None:
             if para.garbled:
                 self.statusBar().showMessage("This text can't be read from the PDF, so it can't be moved. "
@@ -1503,7 +1717,30 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(done, 4000)
         return True
 
+    def _annot_op(self, op, item: Annot, *args, done: str = "", key=None) -> bool:
+        self._snapshot()
+        try:
+            op(self.doc[self.page_no], item, *args)
+        except ValueError as exc:
+            self.undo_stack.pop()
+            QMessageBox.information(self, APP_NAME, str(exc))
+            return False
+        except Exception as exc:
+            self._restore(self.undo_stack.pop())
+            self.render()
+            QMessageBox.critical(self, APP_NAME, f"Could not change the annotation:\n{exc}")
+            return False
+        self._select_key = key
+        self._changed()
+        if done:
+            self.statusBar().showMessage(done, 4000)
+        return True
+
     def move_item(self, item, dx: float, dy: float):
+        if isinstance(item, Annot):
+            r = item.rect + (dx, dy, dx, dy)
+            self._annot_op(AN.move_annot, item, r, key=("annot", r.x0, r.y0))
+            return
         if isinstance(item, Picture):
             r = item.rect
             new = pymupdf.Rect(r.x0 + dx, r.y0 + dy, r.x1 + dx, r.y1 + dy)
@@ -1512,6 +1749,8 @@ class MainWindow(QMainWindow):
             self._rewrite(item, item.text, dx=dx, dy=dy)
 
     def resize_item(self, item, r: pymupdf.Rect, corner: bool):
+        if isinstance(item, Annot):
+            return
         if isinstance(item, Picture):
             self._picture_op(move_picture, item, r, rect=r, done=f"Picture: {r.width:.0f} × {r.height:.0f} pt")
         else:
@@ -1551,6 +1790,10 @@ class MainWindow(QMainWindow):
             self.canvas.selected = None
             self._picture_op(delete_picture, para, done="Picture deleted (Ctrl+Z to undo)")
             return
+        if isinstance(para, Annot):
+            self.canvas.selected = None
+            self._annot_op(AN.delete_annot, para, done="Deleted (Ctrl+Z to undo)")
+            return
         self._snapshot()
         try:
             delete_paragraph(self.doc[self.page_no], para)
@@ -1566,9 +1809,137 @@ class MainWindow(QMainWindow):
         if isinstance(para, Picture):
             self.replace_image(para)
             return
+        if isinstance(para, Annot):
+            self.edit_note(para)
+            return
         self.set_mode("edit")
         para = next((p for p in self.canvas.paras if self._key(p) == self._key(para)), para)
         self.edit_paragraph(para)
+
+    # ---- annotations, signatures and forms ------------------------------------
+    def add_highlight(self, rect: pymupdf.Rect):
+        if not self.doc:
+            return
+        self._snapshot()
+        AN.add_highlight(self.doc[self.page_no], rect)
+        self._changed()
+
+    def _author(self) -> str:
+        import getpass
+        try:
+            return getpass.getuser()
+        except Exception:
+            return ""
+
+    def _point_clicked(self, pt: pymupdf.Point):
+        if self.canvas.mode == "note":
+            text, ok = QInputDialog.getMultiLineText(self, "Note", "Comment:")
+            if ok and text.strip():
+                self._snapshot()
+                AN.add_note(self.doc[self.page_no], pt, text.strip(), self._author())
+                self._changed()
+        elif self.canvas.mode == "place" and self._signature:
+            png, self._signature = self._signature, None
+            self._snapshot()
+            r = AN.place_signature(self.doc[self.page_no], png, pt)
+            self.set_mode("select")
+            self._select_key = ("pic", r.x0, r.y0)
+            self._changed()
+            self.statusBar().showMessage("Signature placed: drag it to move, corners resize, Delete removes", 6000)
+
+    def edit_note(self, item: Annot):
+        if not item.movable:
+            return
+        text, ok = QInputDialog.getMultiLineText(self, "Note", "Comment:", item.text)
+        if ok:
+            self._annot_op(AN.edit_note, item, text, key=self._key(item))
+
+    def sign(self):
+        if not self.doc:
+            return
+        self._close_inline(save=True)
+        dlg = SignatureDialog(self)
+        if dlg.exec() != QDialog.Accepted or not dlg.result_png:
+            return
+        self._signature = dlg.result_png
+        self.set_mode("place")
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape and self.canvas.mode == "place":
+            self.set_mode("view")
+            return
+        super().keyPressEvent(e)
+
+    def fill_field(self, f: F.Field):
+        if f.readonly:
+            self.statusBar().showMessage(f"“{f.name}” is read-only.", 4000)
+            return
+        page_op = None
+        if f.kind in ("checkbox", "radio"):
+            page_op = lambda page: F.toggle(page, f)
+        elif f.kind == "choice":
+            if not f.options:
+                return
+            menu = QMenu(self)
+            for opt in f.options:
+                a = menu.addAction(opt)
+                a.setCheckable(True)
+                a.setChecked(opt == f.value)
+            r = self.canvas._to_screen(f.rect)
+            chosen = self._popup(menu, self.canvas.mapToGlobal(r.bottomLeft().toPoint()))
+            if not chosen:
+                return
+            font = load_font(self.fonts.paths[self.cur_font])
+            page_op = lambda page: F.choose(page, f, chosen.text(), font)
+        elif f.kind == "signature":
+            self.sign()
+            return
+        elif f.kind == "text":
+            size = f.size or min(max((f.rect.height - 4) / 1.9, 6.0), 14.0)
+            self._open_inline("field", f, f.rect, f.value, self.cur_font, size, self.cur_color, wrap=f.multiline)
+            self.statusBar().showMessage(f"Filling in “{f.name}”: Enter = save, Esc = cancel.")
+            return
+        if page_op:
+            self._snapshot()
+            page_op(self.doc[self.page_no])
+            self._changed()
+
+    def _context_menu(self, at, pt: pymupdf.Point):
+        """Right-click: what can be done with the things under the mouse."""
+        if not self.doc:
+            return
+        c = self.canvas
+        menu = QMenu(self)
+        for a in c.annots:
+            if pt in a.rect:
+                if a.movable:
+                    menu.addAction("Edit Note…", lambda a=a: self.edit_note(a))
+                menu.addAction("Delete Note" if a.movable else "Remove Highlight",
+                               lambda a=a: self._annot_op(AN.delete_annot, a, done="Removed (Ctrl+Z to undo)"))
+        para = next((p for p in c.paras if pt in block_rect(p)), None)
+        if para:
+            menu.addAction("Edit Text", lambda: (self.set_mode("edit"), self.edit_paragraph(
+                next((p for p in self.canvas.paras if self._key(p) == self._key(para)), para))))
+            menu.addAction("Highlight", lambda: self.add_highlight(block_rect(para)))
+        pic = next((p for p in reversed(c.pics) if pt in p.rect), None)
+        if pic:
+            menu.addAction("Replace Image…", lambda: self.replace_image(pic))
+            menu.addAction("Delete Image", lambda: self._picture_op(delete_picture, pic, done="Picture deleted"))
+        if not menu.isEmpty():
+            menu.addSeparator()
+        menu.addAction("Add Note Here…", lambda: (self.set_mode("note"), self._point_clicked(pt)))
+        menu.addAction("Add Text Here", lambda: (self.set_mode("add"), self.add_text_at(
+            pymupdf.Rect(pt.x, pt.y, pt.x + 300, pt.y + 60))))
+        menu.addSeparator()
+        for a in self.page_acts:
+            if a is None:
+                break
+            menu.addAction(a)
+        self._popup(menu, at)
+
+    def _popup(self, menu: QMenu, at) -> QAction | None:
+        """Show a popup menu; returns the chosen action (tests replace this)."""
+        return menu.exec(at)
 
     # ---- in-place editing -------------------------------------------------
     def add_text_at(self, rect: pymupdf.Rect):
@@ -1621,6 +1992,8 @@ class MainWindow(QMainWindow):
         self._close_inline(save=True)
         if kind == "edit":
             target = next((ln for ln in self.canvas.lines if ln.rect == target.rect), target)
+        elif kind == "field":
+            target = next((f for f in self.canvas.fields if f.xref == target.xref), target)
         elif kind == "para":
             target = next((p for p in self.canvas.paras if self._key(p) == self._key(target)), target)
         # the toolbar shows (and controls) the style of the text being edited
@@ -1636,6 +2009,8 @@ class MainWindow(QMainWindow):
         s = self.canvas.scale
         ed = InlineEditor(self.canvas, rect.width * s if wrap else None)
         ed.min_width = rect.width * s + 12  # always cover the original text completely
+        if kind == "field":
+            ed.min_height = rect.height * s + 10
         garbled = kind == "edit" and target.garbled
         ed.setPlaceholderText("Type the replacement text…" if garbled else "Type here…")
         ed.setPlainText(text)
@@ -1643,16 +2018,18 @@ class MainWindow(QMainWindow):
         ed.cancel.connect(lambda: self._close_inline(save=False))
         grip = EditorGrip(self.canvas, ed)
         self.inline = dict(editor=ed, grip=grip, kind=kind, line=target if kind == "edit" else None,
-                           para=target if kind == "para" else None, rect=pymupdf.Rect(rect),
+                           para=target if kind == "para" else None, field=target if kind == "field" else None,
+                           rect=pymupdf.Rect(rect),
                            start=(text, font, size, QColor(color).name()))
         self._style_inline()
-        top = (target.baseline - size * 1.0) * s if kind == "edit" else rect.y0 * s
+        top = (target.baseline - size * 1.0) * s if kind == "edit" else rect.y0 * s + (5 if kind == "field" else 0)
         ed.move(int(rect.x0 * s) - 5, int(min(top, rect.y0 * s)) - 5)
         self.inline["origin"] = QPoint(ed.pos())
         ed.show()
         ed.fit()  # again, now that it is laid out on screen
-        grip.show()
-        grip.place()
+        if kind != "field":  # a form field stays where the form has it
+            grip.show()
+            grip.place()
         ed.setFocus()
         ed.moveCursor(ed.textCursor().MoveOperation.End)
         self.insert_zwsp_act.setEnabled(True)
@@ -1695,7 +2072,19 @@ class MainWindow(QMainWindow):
             return
         if st["kind"] == "edit" and (unchanged or (st["line"].garbled and not text.strip())):
             return
-        if st["kind"] == "para" and unchanged:
+        if st["kind"] in ("para", "field") and unchanged:
+            return
+        if st["kind"] == "field":
+            c = self.cur_color
+            self._snapshot()
+            try:
+                F.fill_text(self.doc[self.page_no], st["field"], text, font=load_font(self.fonts.paths[self.cur_font]),
+                            color=(c.redF(), c.greenF(), c.blueF()))
+            except ValueError as exc:
+                self.undo_stack.pop()
+                QMessageBox.information(self, APP_NAME, str(exc))
+                return
+            self._changed()
             return
         c = self.cur_color
         rgb = (c.redF(), c.greenF(), c.blueF())

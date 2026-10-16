@@ -167,6 +167,11 @@ _ICONS = {
                '<path d="M12 11v6"/><path d="M9 14h6"/>',
     "rotleft": '<path d="M4 4.5V9h4.5"/><path d="M4.8 9A8 8 0 1 1 6 16.5"/>',
     "rotright": '<path d="M20 4.5V9h-4.5"/><path d="M19.2 9A8 8 0 1 0 18 16.5"/>',
+    "highlight": '<path d="m9.5 13.5-4 4V20h2.5l4-4"/><path d="m9.5 13.5 6.5-8.5 4 3.5-8.5 7.5z"/>'
+                 '<path d="M14 20.5h6.5"/>',
+    "note": '<path d="M20 14.5a2 2 0 0 1-2 2H9l-4.5 4v-14a2 2 0 0 1 2-2H18a2 2 0 0 1 2 2z"/>'
+            '<path d="M8.5 9h7"/><path d="M8.5 12.5h4.5"/>',
+    "sign": '<path d="M3.5 20.5h17"/><path d="m15 4 3.5 3.5L9 17H5.5v-3.5z"/>',
     "close": '<path d="M6 6l12 12"/><path d="M18 6 6 18"/>',
     "check": '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
 }

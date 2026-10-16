@@ -379,3 +379,68 @@ def test_print_pages(pages_win, tmp_path):
     printed = pymupdf.open(out)
     assert printed.page_count == 3
     assert printed[0].get_images()      # each page carries the rendered page
+
+
+# ---- forms, highlights, notes, signatures ------------------------------------
+def _click(w, rect_or_point, button=Qt.LeftButton):
+    c = w.canvas
+    pt = rect_or_point if isinstance(rect_or_point, pymupdf.Point) else (rect_or_point.tl + rect_or_point.br) / 2
+    QTest.mouseClick(c, button, pos=QPoint(int(pt.x * c.scale), int(pt.y * c.scale)))
+    QApplication.processEvents()
+
+
+def test_fill_a_form_by_clicking(qapp, tmp_path, monkeypatch):
+    from tests.test_forms_annots import _form
+    fn = tmp_path / "form.pdf"
+    _form().save(fn)
+    w = A.MainWindow()
+    w.show()
+    w.open_file(str(fn))
+    assert w.banner.kind == "form"
+    fields = {f.name: f for f in w.canvas.fields}
+    _click(w, fields["name"].rect)                                   # View tool: click a text field
+    assert w.inline["kind"] == "field"
+    w.inline["editor"].setPlainText("សុខ ស្រីនិច្ច")
+    QTest.keyClick(w.inline["editor"], Qt.Key_Return)
+    _click(w, fields["agree"].rect)                                  # tick the checkbox
+    monkeypatch.setattr(w, "_popup", lambda menu, at: next(x for x in menu.actions() if x.text() == "ថ្នាក់ទី៨"))
+    _click(w, fields["grade"].rect)                                  # pick from the list
+    values = {f.name: f.value for f in w.canvas.fields}
+    assert values["name"] == "សុខ ស្រីនិច្ច" and values["agree"] == "Yes" and values["grade"] == "ថ្នាក់ទី៨"
+    assert len(w.undo_stack) == 3
+    w.dirty = False
+    w.close()
+
+
+def test_highlight_note_and_right_click(win, monkeypatch):
+    w = win
+    w.set_mode("highlight")
+    line = w.canvas.lines[0]
+    _click(w, line.rect)                                             # a click highlights the line
+    assert [a.kind for a in w.canvas.annots] == ["highlight"]
+    w.set_mode("note")
+    monkeypatch.setattr(A.QInputDialog, "getMultiLineText", lambda *a, **k: ("សូមពិនិត្យ", True))
+    _click(w, pymupdf.Point(400, 600))
+    assert sorted(a.kind for a in w.canvas.annots) == ["highlight", "note"]
+    shown = []
+    monkeypatch.setattr(w, "_popup", lambda menu, at: shown.extend(x.text() for x in menu.actions()))
+    w._context_menu(QPoint(0, 0), (line.rect.tl + line.rect.br) / 2)
+    assert "Remove Highlight" in shown and "Edit Text" in shown
+    w.set_mode("select")
+    note = next(a for a in w.canvas.annots if a.kind == "note")
+    _click(w, note.rect)
+    assert w.canvas.selected.kind == "note"
+    w.delete_selection()
+    assert [a.kind for a in w.canvas.annots] == ["highlight"]
+
+
+def test_place_a_signature(win):
+    from tests.test_forms_annots import pymupdf as pm
+    sig = pm.open().new_page(width=300, height=100)
+    sig.draw_line((20, 60), (280, 40), width=3)
+    w = win
+    w._signature = sig.get_pixmap(dpi=96, alpha=True).tobytes("png")
+    w.set_mode("place")
+    _click(w, pymupdf.Point(400, 700))
+    assert w.canvas.mode == "select" and isinstance(w.canvas.selected, A.Picture)
+    assert abs((w.canvas.selected.rect.x0 + w.canvas.selected.rect.x1) / 2 - 400) < 2
