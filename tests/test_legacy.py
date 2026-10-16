@@ -64,3 +64,31 @@ def test_convert_document_text_to_unicode():
     assert sorted(ln.text for ln in lines) == ["កម្ពុជា សាលារៀន", "សៀវភៅ"]
     assert not any(ln.legacy for ln in lines)
     assert "សៀវភៅ" in page.get_text()
+
+
+def _encode(word_tokens, family):
+    """Type tokens (in visual order) with a legacy font's codes - the tables
+    used backwards, so every family is tested without its font files."""
+    from khmerpdf.legacy_tables import TABLES
+    rev = {}
+    for codes, text in sorted(TABLES[family].items(), key=lambda kv: len(kv[0])):
+        rev.setdefault(text, codes)
+    return b"".join(rev[t] for t in word_tokens).decode("cp1252", errors="replace")
+
+
+@pytest.mark.parametrize("family", ["limon", "abc", "abc2", "abc-zwsp", "truth", "baidok", "khek", "fk"])
+def test_every_legacy_family(family):
+    from khmerpdf.legacy import to_unicode
+    # កម្ពុជា and ក្រោម, typed visually: េ and ្រ before their consonant
+    assert to_unicode(_encode(["ក", "ម", "្ព", "ុ", "ជ", "ា"], family), family) == "កម្ពុជា"
+    assert to_unicode(_encode(["េ", "្រ", "ក", "ា", "ម"], family), family) == "ក្រោម"
+
+
+@pytest.mark.parametrize("name,family", [("ABCDEF+LimonS1", "limon"), ("Limon R1 Regular", "limon"),
+                                         ("ABC-TEXT-05", "abc"), ("ABC-TEXT-11", "abc2"), ("ABC-TEXT-05A", "abc-zwsp"),
+                                         ("ABC-TEXT-99", "abc"), ("Truth11", "truth"), ("Khek Mool", "khek"),
+                                         ("Baidok3C", "baidok"), ("FK1", "fk"), ("Khmer OS Battambang", None),
+                                         ("Arial", None)])
+def test_family_from_font_name(name, family):
+    from khmerpdf.legacy import legacy_family
+    assert legacy_family(name) == family

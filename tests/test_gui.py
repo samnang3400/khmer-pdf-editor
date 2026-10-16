@@ -165,7 +165,7 @@ def test_edit_a_whole_paragraph(block_win):
     assert len(paras) == 1 and paras[0].text == "សួស្តី " + para.text
 
 
-def test_limon_banner_and_conversion(qapp, tmp_path, monkeypatch):
+def test_legacy_font_banner_and_conversion(qapp, tmp_path, monkeypatch):
     from tests.test_legacy import _limon_pdf
     fn = tmp_path / "limon.pdf"
     _limon_pdf().save(fn)

@@ -570,7 +570,7 @@ class Welcome(QWidget):
         title = QLabel(APP_NAME, objectName="title", alignment=Qt.AlignHCenter)
         lay.addWidget(title)
         sub = QLabel("Edit Khmer PDFs with correct shaping. Text stays searchable and copyable.\n"
-                     "Fixes broken Word PDFs, converts Limon text and reads scans.",
+                     "Fixes broken Word PDFs, converts Limon/ABC text and reads scans.",
                      objectName="muted", alignment=Qt.AlignHCenter, wordWrap=True)
         lay.addWidget(sub)
         lay.addSpacing(10)
@@ -959,8 +959,8 @@ class MainWindow(QMainWindow):
         ocr_btn.setPopupMode(QToolButton.MenuButtonPopup)
         ocr_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         tb.addWidget(ocr_btn)
-        self.limon_act = self._act("Convert Limon", self.convert_limon, "convert", None,
-                                   "Rewrite text in the legacy Limon font as Unicode Khmer", tb)
+        self.limon_act = self._act("Convert to Unicode", self.convert_limon, "convert", None,
+                                   "Rewrite text in legacy Khmer fonts (Limon, ABC, Khek...) as Unicode Khmer", tb)
         tb.widgetForAction(self.limon_act).setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
         spacer = QWidget()
@@ -1136,7 +1136,7 @@ class MainWindow(QMainWindow):
     def about(self):
         QMessageBox.about(self, f"About {APP_NAME}",
                           f"<b>{APP_NAME}</b> {__version__}<br><br>A PDF editor built for Khmer text: correct "
-                          "shaping, searchable text, recovery of broken Khmer PDFs, Limon conversion and OCR."
+                          "shaping, searchable text, recovery of broken Khmer PDFs, legacy font (Limon, ABC) conversion and OCR."
                           "<br><br>Footprints International School<br><br>"
                           "<small>Built with PyMuPDF (AGPL), Qt for Python, HarfBuzz and Tesseract OCR. "
                           "Fonts: Khmer OS (LGPL), Battambang and Moul (OFL).</small>")
@@ -1616,7 +1616,7 @@ class MainWindow(QMainWindow):
             self.banner.show_message("scan", "This page is a scanned image. Recognize its text to search, copy "
                                      "and edit it.", "Recognize Text", self.ocr_page, False, t)
         elif "limon" not in self._dismissed and any(ln.legacy for ln in self.canvas.lines):
-            self.banner.show_message("limon", "This page uses the legacy Limon font. Its text is shown as "
+            self.banner.show_message("limon", "This page uses a legacy Khmer font (Limon, ABC…). Its text is shown as "
                                      "Unicode when you edit it; convert it so it can be searched and copied.",
                                      "Convert to Unicode", self.convert_limon, False, t)
         elif "check" not in self._dismissed and any(p.needs_check for p in self.canvas.paras):
@@ -1956,7 +1956,7 @@ class MainWindow(QMainWindow):
             msg = ("⚠ This PDF's font isn't available, so the text was rebuilt with Khmer spelling rules and may "
                    "contain mistakes. Please check it before saving.")
         elif any(ln.legacy for ln in getattr(item, "lines", [item])):
-            msg = "Converted from the legacy Limon font to Unicode. Enter = save, Esc = cancel."
+            msg = "Converted from a legacy Khmer font (Limon, ABC…) to Unicode. Enter = save, Esc = cancel."
         elif any(ln.recovered for ln in getattr(item, "lines", [item])):
             msg = f"Text recovered from the glyphs ({font}). Enter = save, Shift+Enter = new line, Esc = cancel."
         else:
@@ -2149,7 +2149,7 @@ class MainWindow(QMainWindow):
         self.undo_act.setEnabled(bool(self.undo_stack))
         self.redo_act.setEnabled(bool(self.redo_stack))
 
-    # ---- OCR and Limon ----------------------------------------------------
+    # ---- OCR and legacy fonts ---------------------------------------------
     def ocr_page(self):
         self.run_ocr([self.page_no])
 
@@ -2206,7 +2206,7 @@ class MainWindow(QMainWindow):
         if not self.doc:
             return
         self._close_inline(save=True)
-        r = QMessageBox.question(self, APP_NAME, "Rewrite all Limon-font text in this document as Unicode Khmer "
+        r = QMessageBox.question(self, APP_NAME, "Rewrite all text in legacy Khmer fonts (Limon, ABC…) as Unicode Khmer "
                                  f"in “{self.cur_font}”?\n\nThe text keeps its place and width, and becomes "
                                  "searchable and copyable. (Pick another font in the toolbar first if you like.)",
                                  QMessageBox.Ok | QMessageBox.Cancel)
@@ -2229,7 +2229,7 @@ class MainWindow(QMainWindow):
         total = sum(counts.values())
         if not total:
             self.undo_stack.pop()
-            self.statusBar().showMessage("No Limon-font text found in this document.", 5000)
+            self.statusBar().showMessage("No text in legacy Khmer fonts found in this document.", 5000)
             return
         self._changed([n for n, c in counts.items() if c])
         self.statusBar().showMessage(f"Converted {total} line{'s' if total != 1 else ''} to Unicode.", 6000)

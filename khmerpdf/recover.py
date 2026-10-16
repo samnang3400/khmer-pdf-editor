@@ -22,7 +22,7 @@ from pathlib import Path
 import pymupdf
 import uharfbuzz as hb
 
-from .legacy import is_limon_font, limon_to_unicode
+from .legacy import legacy_family, to_unicode
 
 FONT_DIR = Path(__file__).parent / "fonts"
 
@@ -712,11 +712,11 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = (),
         if not re.sub(r"[\s\u17b6-\u17d3\u17dd\u200b]", "", original):
             continue
         text = original
-        legacy = any(is_limon_font(g[6]) for g in gl)
+        legacy = any(legacy_family(g[6]) for g in gl)
         if legacy:
-            # Limon: convert the font's codes, run by run (Latin words may be in another font)
-            runs = [(k, "".join(g[4] for g in grp)) for k, grp in itertools.groupby(gl, key=lambda g: is_limon_font(g[6]))]
-            text = "".join(limon_to_unicode(t) if k else t for k, t in runs).replace("\xa0", " ").strip()
+            # Limon, ABC...: convert the font's codes, run by run (Latin words may be in another font)
+            runs = [(k, "".join(g[4] for g in grp)) for k, grp in itertools.groupby(gl, key=lambda g: legacy_family(g[6]))]
+            text = "".join(to_unicode(t, k) if k else t for k, t in runs).replace("\xa0", " ").strip()
         elif any(g[8] for g in gl):
             # Word draws glyphs in visual order; other tools draw them in logical
             # order with explicit positions. Try the drawing order and the
