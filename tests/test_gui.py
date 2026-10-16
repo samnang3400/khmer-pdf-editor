@@ -444,3 +444,62 @@ def test_place_a_signature(win):
     _click(w, pymupdf.Point(400, 700))
     assert w.canvas.mode == "select" and isinstance(w.canvas.selected, A.Picture)
     assert abs((w.canvas.selected.rect.x0 + w.canvas.selected.rect.x1) / 2 - 400) < 2
+
+
+# ---- scrolling between pages, tabs --------------------------------------------
+def _wheel(w, dy):
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QWheelEvent
+    vp = w.scroll.viewport()
+    pos = QPointF(vp.width() / 2, vp.height() / 2)
+    ev = QWheelEvent(pos, vp.mapToGlobal(pos), QPoint(0, 0), QPoint(0, dy), Qt.NoButton, Qt.NoModifier,
+                     Qt.NoScrollPhase, False)
+    QApplication.sendEvent(vp, ev)
+    QApplication.processEvents()
+
+
+def test_scrolling_past_the_page_end_turns_the_page(pages_win):
+    w = pages_win
+    w.set_zoom(2.0)  # taller than the window, so the page scrolls first
+    QApplication.processEvents()
+    bar = w.scroll.verticalScrollBar()
+    assert bar.maximum() > 0
+    _wheel(w, -120)
+    assert w.page_no == 0 and bar.value() > 0          # scrolls within the page
+    bar.setValue(bar.maximum())
+    _wheel(w, -120)
+    assert w.page_no == 1 and bar.value() == 0          # on to the top of page 2
+    _wheel(w, 120)
+    assert w.page_no == 0 and bar.value() == bar.maximum()  # back to the bottom of page 1
+    w.set_zoom(0.5)  # the whole page fits: each notch turns a page
+    QApplication.processEvents()
+    _wheel(w, -120)
+    _wheel(w, -120)
+    assert w.page_no == 2
+
+
+def test_documents_open_in_tabs(pages_win, tmp_path, monkeypatch):
+    w = pages_win
+    first = w.path
+    second = tmp_path / "second.pdf"
+    _broken_pdf().save(second)
+    w.goto(2)
+    w._snapshot()
+    w.doc.delete_page(3)
+    w._changed()
+    assert w.tab_bar.tabText(0).startswith("• ")
+    w.open_file(str(second))
+    assert w.tab_bar.count() == 2 and w.path == str(second) and w.doc.page_count == 1
+    assert not w.undo_stack and not w.dirty
+    w.tab_bar.setCurrentIndex(0)                         # each tab keeps its own document
+    assert w.path == first and w.page_no == 2 and w.doc.page_count == 3 and len(w.undo_stack) == 1
+    w.open_file(str(second))                             # already open: switch to it
+    assert w.tab_bar.count() == 2 and w.path == str(second)
+    w.tab_bar.setCurrentIndex(0)
+    asked = []
+    monkeypatch.setattr(A.QMessageBox, "question", lambda *a, **k: asked.append(a[2]) or A.QMessageBox.Discard)
+    assert w.close_tab(0)
+    assert asked == ["Save changes to “pages.pdf”?"]
+    assert w.tab_bar.count() == 1 and w.path == str(second)
+    QTest.mouseClick(w.tab_bar.tabButton(0, A.QTabBar.RightSide), Qt.LeftButton)  # its × button
+    assert w.tab_bar.count() == 0 and w.doc is None and w.stack.currentIndex() == 0

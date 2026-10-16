@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QColorDialog, QC
                                QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
                                QPlainTextEdit, QProgressDialog, QPushButton, QScrollArea, QSizePolicy,
                                QSpinBox, QStackedWidget, QStyle, QStyledItemDelegate, QStyleFactory,
-                               QToolBar, QToolButton, QVBoxLayout, QWidget)
+                               QTabBar, QToolBar, QToolButton, QVBoxLayout, QWidget)
 
 from . import __version__, ocr
 from . import annots as AN
@@ -36,6 +36,9 @@ UNDO_LIMIT = 30
 ZWSP = "​"
 RECENT_MAX = 8
 THUMB_W = 112
+WHEEL_FLIP = 120  # wheel movement past the end of a page that turns to the next one (one notch)
+# what each open document (tab) keeps of its own
+DOC_STATE = ("doc", "path", "page_no", "zoom", "undo_stack", "redo_stack", "dirty", "search_hits", "_dismissed")
 
 
 def resource_path(*parts: str) -> Path:
@@ -806,6 +809,10 @@ class MainWindow(QMainWindow):
         self._select_key: tuple[float, float] | None = None
         self._dismissed: set[str] = set()
         self._thumb_queue: list[int] = []
+        self._wheel_push = 0  # wheel movement past the top/bottom of the page so far
+        self._tabs: dict[int, dict] = {}  # tab id -> the document's state while another tab is shown
+        self._tab_id: int | None = None   # the tab being shown
+        self._next_tab = 0
 
         self.canvas = PageCanvas(self.theme)
         self.canvas.rect_drawn.connect(self.add_text_at)
@@ -844,12 +851,26 @@ class MainWindow(QMainWindow):
         rl.setSpacing(0)
         rl.addWidget(self.banner)
         rl.addWidget(self.scroll)
-        doc_view = QWidget()
-        dl = QHBoxLayout(doc_view)
+        body = QWidget()
+        dl = QHBoxLayout(body)
         dl.setContentsMargins(0, 0, 0, 0)
         dl.setSpacing(0)
         dl.addWidget(self.thumbs)
         dl.addWidget(right)
+        self.tab_bar = QTabBar(objectName="docTabs")
+        self.tab_bar.setMovable(True)
+        self.tab_bar.setDocumentMode(True)
+        self.tab_bar.setDrawBase(False)  # (the stylesheet draws the line under the tabs)
+        self.tab_bar.setExpanding(False)
+        self.tab_bar.setElideMode(Qt.ElideMiddle)
+        self.tab_bar.setUsesScrollButtons(True)
+        self.tab_bar.currentChanged.connect(self._tab_changed)
+        doc_view = QWidget()
+        vl = QVBoxLayout(doc_view)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(0)
+        vl.addWidget(self.tab_bar)
+        vl.addWidget(body)
 
         self.welcome = Welcome()
         self.welcome.open_clicked.connect(self.open_dialog)
@@ -1095,6 +1116,10 @@ class MainWindow(QMainWindow):
         ]
         self.about_act = a("About KhmerPDF Editor", self.about)
         self.quit_act = a("Quit", self.close, None, QKeySequence.Quit)
+        self.close_tab_act = a("Close", lambda: self.close_tab(self.tab_bar.currentIndex()), None,
+                               QKeySequence.Close, "Close this document")
+        self.next_tab_act = a("Next Document", lambda: self._step_tab(1), None, "Ctrl+Tab")
+        self.prev_tab_act = a("Previous Document", lambda: self._step_tab(-1), None, "Ctrl+Shift+Tab")
         self.zoom_in_act = a("Zoom In", lambda: self.set_zoom(self.zoom * 1.2))
         self.zoom_out_act = a("Zoom Out", lambda: self.set_zoom(self.zoom / 1.2))
         self.zoom_100_act = a("Actual Size", lambda: self.set_zoom(1.0), None, "Ctrl+0")
@@ -1117,10 +1142,10 @@ class MainWindow(QMainWindow):
         self.recent_menu = QMenu("Open Recent")
         self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
         menu("&File", [self.open_act, self.recent_menu, None, self.save_act, self.save_as_act, None,
-                       self.print_act, self.preview_act, None, self.quit_act])
+                       self.print_act, self.preview_act, None, self.close_tab_act, self.quit_act])
         menu("&Edit", [self.undo_act, self.redo_act, None, self.find_act, self.delete_act, self.replace_img_act])
         menu("&View", [self.sidebar_act, None, self.zoom_in_act, self.zoom_out_act, self.zoom_100_act,
-                       self.fit_act])
+                       self.fit_act, None, self.next_tab_act, self.prev_tab_act])
         self.pages_menu = menu("&Pages", self.page_acts)
         menu("&Tools", [*self.mode_actions.values(), None, self.sign_act, self.insert_zwsp_act, None,
                         self.ocr_act, self.ocr_all_act, self.limon_act])
@@ -1358,6 +1383,8 @@ class MainWindow(QMainWindow):
         for w, name in self._icons:
             w.setIcon(T.icon(name, t))
         self.find_icon.setIcon(T.icon("search", t))
+        for i in range(self.tab_bar.count()):
+            self.tab_bar.tabButton(i, QTabBar.RightSide).setIcon(T.icon("close", t))
         self.canvas.theme = t
         self.canvas.update()
         self.welcome.set_theme(t)
@@ -1366,7 +1393,8 @@ class MainWindow(QMainWindow):
             self._update_banner()
 
     def _doc_controls(self, on: bool):
-        for a in (self.save_act, self.save_as_act, self.ocr_act, self.ocr_all_act, self.limon_act,
+        for a in (self.save_act, self.save_as_act, self.close_tab_act, self.next_tab_act, self.prev_tab_act,
+                  self.ocr_act, self.ocr_all_act, self.limon_act,
                   self.print_act, self.preview_act, self.sign_act, *self.mode_actions.values(),
                   *[x for x in getattr(self, "page_acts", []) if x]):
             a.setEnabled(on)
@@ -1455,19 +1483,23 @@ class MainWindow(QMainWindow):
         self.welcome.set_recent(paths[:RECENT_MAX])
 
     def _open_recent(self, path: str):
-        if self._confirm_discard():
-            self.open_file(path)
+        self.open_file(path)
 
     def open_dialog(self):
         self._close_inline(save=True)
-        if not self._confirm_discard():
-            return
         start = str(Path(self._recent()[0]).parent) if self._recent() else ""
-        path, _ = QFileDialog.getOpenFileName(self, "Open PDF", start, "PDF files (*.pdf)")
-        if path:
+        paths, _ = QFileDialog.getOpenFileNames(self, "Open PDF", start, "PDF files (*.pdf)")
+        for path in paths:
             self.open_file(path)
 
     def open_file(self, path: str):
+        """Open `path` in a new tab (or switch to its tab if it is already open)."""
+        for i in range(self.tab_bar.count()):
+            st = self._tabs.get(self.tab_bar.tabData(i), {})
+            other = self.path if self.tab_bar.tabData(i) == self._tab_id else st.get("path")
+            if other and Path(other).resolve() == Path(path).resolve():
+                self.tab_bar.setCurrentIndex(i)
+                return
         try:
             data = Path(path).read_bytes()
             doc = pymupdf.open(stream=data, filetype="pdf")  # in memory: no file lock on Windows
@@ -1477,17 +1509,14 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, APP_NAME, f"Could not open the file:\n{exc}")
             return
+        self._close_inline(save=True)
+        self._stash()
         self.doc, self.path, self.page_no = doc, path, 0
-        self.undo_stack.clear()
-        self.redo_stack.clear()
+        self.undo_stack, self.redo_stack = [], []
         self.dirty = False
         self.search_hits = []
-        self._dismissed.clear()
+        self._dismissed = set()
         self._doc_controls(True)
-        self.page_spin.blockSignals(True)
-        self.page_spin.setMaximum(doc.page_count)
-        self.page_spin.blockSignals(False)
-        self.page_total.setText(f" / {doc.page_count} ")
         self._add_recent(path)
         # start at 100%, or narrower if the page wouldn't fit
         self.zoom = 1.0
@@ -1495,9 +1524,96 @@ class MainWindow(QMainWindow):
         pw = doc[0].rect.width * SCREEN_DPI / 72
         if self.isVisible() and vw > 200 and pw > vw:
             self.zoom = max(vw / pw, 0.25)
+        self._tab_id, self._next_tab = self._next_tab, self._next_tab + 1
+        self.tab_bar.blockSignals(True)
+        i = self.tab_bar.addTab(Path(path).name)
+        self.tab_bar.setTabData(i, self._tab_id)
+        self.tab_bar.setTabButton(i, QTabBar.RightSide, self._tab_close_button())
+        self.tab_bar.setCurrentIndex(i)
+        self.tab_bar.blockSignals(False)
+        self._show_doc()
+
+    # ---- tabs -----------------------------------------------------------
+    def _stash(self):
+        """Keep the shown document's state (and its page pictures) while another tab is shown."""
+        if self._tab_id is None or not self.doc:
+            return
+        st = {k: getattr(self, k) for k in DOC_STATE}
+        st["scroll"] = (self.scroll.horizontalScrollBar().value(), self.scroll.verticalScrollBar().value())
+        st["thumbs"] = [self.thumbs.item(i).icon() for i in range(self.thumbs.count())]
+        st["thumb_queue"] = list(self._thumb_queue)
+        self._tabs[self._tab_id] = st
+
+    def _show_doc(self, st: dict | None = None):
+        """Show the document now in self.doc (with what `st` remembered of it)."""
+        self.canvas.selected = None
+        self.page_spin.blockSignals(True)
+        self.page_spin.setMaximum(self.doc.page_count)
+        self.page_spin.blockSignals(False)
+        self.page_total.setText(f" / {self.doc.page_count} ")
         self._rebuild_thumbs()
+        if st and len(st["thumbs"]) == self.thumbs.count():
+            for i, ic in enumerate(st["thumbs"]):
+                self.thumbs.item(i).setIcon(ic)
+            self._thumb_queue = st["thumb_queue"]
+        self.find_box.setText("")
         self.render()
         self._refresh_undo_actions()
+        if st:
+            x, y = st["scroll"]
+            QTimer.singleShot(0, lambda: (self.scroll.horizontalScrollBar().setValue(x),
+                                          self.scroll.verticalScrollBar().setValue(y)))
+
+    def _tab_changed(self, i: int):
+        tid = self.tab_bar.tabData(i) if i >= 0 else None
+        if tid is None or tid == self._tab_id:
+            return
+        self._close_inline(save=True)
+        self._stash()
+        st = self._tabs.pop(tid)
+        for k in DOC_STATE:
+            setattr(self, k, st[k])
+        self._tab_id = tid
+        self._show_doc(st)
+
+    def _tab_close_button(self) -> QToolButton:
+        b = QToolButton(autoRaise=True, objectName="tabClose")
+        b.setToolTip("Close")
+        b.setIcon(T.icon("close", self.theme))
+        b.setIconSize(QSize(12, 12))
+        b.setCursor(Qt.PointingHandCursor)
+        b.clicked.connect(lambda: self.close_tab(next(
+            i for i in range(self.tab_bar.count()) if self.tab_bar.tabButton(i, QTabBar.RightSide) is b)))
+        return b
+
+    def _step_tab(self, step: int):
+        n = self.tab_bar.count()
+        if n > 1:
+            self.tab_bar.setCurrentIndex((self.tab_bar.currentIndex() + step) % n)
+
+    def close_tab(self, i: int) -> bool:
+        """Close a document (asking to save it first if it changed)."""
+        if i < 0:
+            return True
+        self.tab_bar.setCurrentIndex(i)
+        self._close_inline(save=True)
+        if not self._confirm_discard():
+            return False
+        self.tab_bar.blockSignals(True)
+        self.tab_bar.removeTab(i)
+        self.tab_bar.blockSignals(False)
+        self._tab_id, self.doc = None, None
+        if self.tab_bar.count():
+            self._tab_changed(self.tab_bar.currentIndex())
+        else:
+            self.path, self.dirty, self.undo_stack, self.redo_stack = None, False, [], []
+            self.thumbs.clear()
+            self._thumb_queue = []
+            self.banner.hide()
+            self._doc_controls(False)
+            self._refresh_undo_actions()
+            self._update_title()
+        return True
 
     def render(self):
         if not self.doc:
@@ -1535,12 +1651,18 @@ class MainWindow(QMainWindow):
         self._update_banner(page)
         self._update_title()
 
-    def goto(self, n: int):
+    def goto(self, n: int, at_end: bool = False):
+        """Show page n, from its top (or its bottom, when scrolling back up into it)."""
         if self.doc and 0 <= n < self.doc.page_count and n != self.page_no:
             self.page_no = n
             self.canvas.selected = None
             self.render()
-            self.scroll.verticalScrollBar().setValue(0)
+            bar = self.scroll.verticalScrollBar()
+            bar.setValue(0)
+            if at_end:  # the scroll range is known once the new page is laid out
+                self.scroll.widget().adjustSize()
+                QApplication.processEvents()
+                bar.setValue(bar.maximum())
 
     def set_zoom(self, z: float):
         self.zoom = min(max(z, 0.25), 6.0)
@@ -1552,10 +1674,33 @@ class MainWindow(QMainWindow):
             self.set_zoom((self.scroll.viewport().width() - 64) / pw)
 
     def eventFilter(self, obj, e):
-        if obj is self.scroll.viewport() and e.type() == QEvent.Wheel and e.modifiers() & Qt.ControlModifier:
-            self.set_zoom(self.zoom * (1.1 if e.angleDelta().y() > 0 else 1 / 1.1))
-            return True
+        if obj is self.scroll.viewport() and e.type() == QEvent.Wheel:
+            if e.modifiers() & Qt.ControlModifier:
+                self.set_zoom(self.zoom * (1.1 if e.angleDelta().y() > 0 else 1 / 1.1))
+                return True
+            if self._wheel_flip(e.angleDelta().y()):
+                return True
         return super().eventFilter(obj, e)
+
+    def _wheel_flip(self, dy: int) -> bool:
+        """Scrolling on past the bottom of a page turns to the next one (and past the
+        top, back to the previous one). Returns True if the wheel event was used."""
+        bar = self.scroll.verticalScrollBar()
+        if not self.doc or not dy:
+            return False
+        down = dy < 0
+        at_edge = bar.value() >= bar.maximum() if down else bar.value() <= bar.minimum()
+        more = self.page_no < self.doc.page_count - 1 if down else self.page_no > 0
+        if not (at_edge and more):
+            self._wheel_push = 0
+            return False
+        if self._wheel_push * dy < 0:  # changed direction
+            self._wheel_push = 0
+        self._wheel_push += dy
+        if abs(self._wheel_push) >= WHEEL_FLIP:
+            self._wheel_push = 0
+            self.goto(self.page_no + (1 if down else -1), at_end=not down)
+        return True
 
     # ---- thumbnails -----------------------------------------------------
     def _rebuild_thumbs(self):
@@ -2291,7 +2436,8 @@ class MainWindow(QMainWindow):
     def _confirm_discard(self) -> bool:
         if not self.dirty:
             return True
-        r = QMessageBox.question(self, APP_NAME, "Save changes to this document?",
+        name = Path(self.path).name if self.path else "this document"
+        r = QMessageBox.question(self, APP_NAME, f"Save changes to “{name}”?",
                                  QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
         if r == QMessageBox.Save:
             return self.save()
@@ -2300,11 +2446,23 @@ class MainWindow(QMainWindow):
     def _update_title(self):
         name = Path(self.path).name if self.path else "No document"
         self.setWindowTitle(f"{'• ' if self.dirty else ''}{name} — {APP_NAME} {__version__}")
+        i = self.tab_bar.currentIndex()
+        if self.doc and i >= 0:
+            self.tab_bar.setTabText(i, f"{'• ' if self.dirty else ''}{name}")
+            self.tab_bar.setTabToolTip(i, self.path or "")
 
     # ---- window events --------------------------------------------------
     def closeEvent(self, e):
         self._close_inline(save=True)
-        e.accept() if self._confirm_discard() else e.ignore()
+        # ask about each changed document, in its own tab
+        for i in range(self.tab_bar.count()):
+            tid = self.tab_bar.tabData(i)
+            if self._tabs.get(tid, {}).get("dirty") or (tid == self._tab_id and self.dirty):
+                self.tab_bar.setCurrentIndex(i)
+                if not self._confirm_discard():
+                    e.ignore()
+                    return
+        e.accept()
 
     def dragEnterEvent(self, e):
         if any(u.toLocalFile().lower().endswith(".pdf") for u in e.mimeData().urls()):
@@ -2312,9 +2470,8 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, e):
         for u in e.mimeData().urls():
-            if u.toLocalFile().lower().endswith(".pdf") and self._confirm_discard():
+            if u.toLocalFile().lower().endswith(".pdf"):
                 self.open_file(u.toLocalFile())
-                break
 
 
 def main():
@@ -2324,8 +2481,9 @@ def main():
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()
-    if len(sys.argv) > 1 and Path(sys.argv[1]).is_file():
-        win.open_file(sys.argv[1])
+    for arg in sys.argv[1:]:
+        if Path(arg).is_file():
+            win.open_file(arg)
     sys.exit(app.exec())
 
 

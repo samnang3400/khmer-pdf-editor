@@ -109,6 +109,13 @@ def stylesheet(t: Theme) -> str:
     QListWidget#thumbs::item {{ border-radius: 6px; padding: 6px 2px 4px 2px; margin: 2px 6px; }}
     QListWidget#thumbs::item:hover {{ background: {t.hover}; }}
     QListWidget#thumbs::item:selected {{ background: {t.accent_soft}; color: {t.accent}; }}
+    QTabBar#docTabs {{ background: {t.surface}; border: none; border-bottom: 1px solid {t.border}; }}
+    QTabBar#docTabs::tab {{ background: transparent; color: {t.muted}; border: none;
+        border-right: 1px solid {t.border}; border-bottom: 2px solid transparent;
+        padding: 6px 8px 5px 12px; min-width: 90px; max-width: 260px; }}
+    QTabBar#docTabs::tab:hover {{ background: {t.hover}; color: {t.text}; }}
+    QTabBar#docTabs::tab:selected {{ background: {t.window}; color: {t.text}; border-bottom-color: {t.accent}; }}
+    QToolButton#tabClose {{ padding: 2px; border-radius: 4px; margin-left: 4px; }}
     QFrame#banner {{ background: {t.info_soft}; border: none; border-bottom: 1px solid {t.border}; }}
     QFrame#banner[kind="warning"] {{ background: {t.warning_soft}; }}
     QFrame#card {{ background: {t.surface}; border: 1px solid {t.border}; border-radius: 12px; }}

@@ -24,7 +24,10 @@ Lines written by the app also store their own text, font, size and colour, so ed
 ## Features
 
 - Open, view, zoom, and page through PDFs (drag and drop works too), with a page-thumbnail sidebar,
-  recent files and a light/dark interface that follows the system setting
+  recent files and a light/dark interface that follows the system setting. Scrolling on past the end
+  of a page turns to the next one
+- **Several documents at once**, each in its own tab with its own undo history (Ctrl+Tab switches,
+  Ctrl+W closes; you're asked to save changed ones)
 - **Edit Text**: click any line or paragraph and edit it right on the page (Enter = save, Shift+Enter =
   new line, Esc = cancel, clicking elsewhere saves). Text from broken Khmer PDFs is recovered first.
   An edited line keeps the original's width (justified paragraphs keep their right edge). Drag the
