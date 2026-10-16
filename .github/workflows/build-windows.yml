@@ -25,6 +25,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
+      - name: Install Tesseract OCR (bundled with the app)
+        shell: pwsh
+        run: |
+          choco install tesseract -y --no-progress
+          $src = "$env:ProgramFiles\Tesseract-OCR"
+          New-Item -ItemType Directory -Force build-deps\tesseract | Out-Null
+          # the program and its libraries; language data comes from khmerpdf/tessdata
+          Copy-Item "$src\tesseract.exe", "$src\*.dll" build-deps\tesseract
+          "KHMERPDF_TESSERACT=$PWD\build-deps\tesseract\tesseract.exe" | Out-File -Append $env:GITHUB_ENV
+
       - name: Run tests
         env:
           QT_QPA_PLATFORM: offscreen

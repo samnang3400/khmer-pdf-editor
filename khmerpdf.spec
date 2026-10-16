@@ -1,16 +1,23 @@
 # PyInstaller spec: builds dist/KhmerPDF/ (one-folder app, wrapped by Inno Setup).
 # Build:  pyinstaller --noconfirm khmerpdf.spec
 import sys
+from pathlib import Path
 
 block_cipher = None
+
+datas = [
+    ("khmerpdf/fonts", "khmerpdf/fonts"),
+    ("khmerpdf/tessdata", "khmerpdf/tessdata"),   # OCR language data (khm, eng)
+    ("assets/icon.ico", "assets"),
+]
+# Tesseract OCR program, copied here by the build (see build-windows.yml)
+if Path("build-deps/tesseract").is_dir():
+    datas.append(("build-deps/tesseract", "tesseract"))
 
 a = Analysis(
     ["run.py"],
     pathex=[],
-    datas=[
-        ("khmerpdf/fonts", "khmerpdf/fonts"),
-        ("assets/icon.ico", "assets"),
-    ],
+    datas=datas,
     hiddenimports=[],
     excludes=[
         # Keep the bundle small: Qt modules the app never uses.
