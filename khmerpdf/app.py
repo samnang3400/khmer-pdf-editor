@@ -867,7 +867,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(760, 520)
         self._update_title()
         self.welcome.set_recent(self._recent())
-        icon = resource_path("assets", "icon.ico")
+        icon = resource_path("assets", "icon.ico" if sys.platform == "win32" else "icon.png")
         if icon.exists():
             self.setWindowIcon(QIcon(str(icon)))
         self.apply_theme(self.theme)
@@ -2320,6 +2320,7 @@ class MainWindow(QMainWindow):
 def main():
     QApplication.setApplicationName(APP_NAME)
     QApplication.setOrganizationName("KhmerPDF")
+    QApplication.setDesktopFileName("khmerpdf")  # Linux: the taskbar icon comes from khmerpdf.desktop
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Khmer PDF Editor
+GenericName=PDF Editor
+Comment=Edit PDFs with Khmer (Unicode) text
+Exec=KhmerPDF %f
+Icon=khmerpdf
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;
+Keywords=PDF;Khmer;Edit;OCR;
+StartupWMClass=KhmerPDF

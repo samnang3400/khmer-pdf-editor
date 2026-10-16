@@ -1,6 +1,6 @@
 # KhmerPDF Editor
 
-A Windows PDF editor built for **Khmer (Unicode)** text. Most PDF editors break Khmer
+A PDF editor for Windows and Linux, built for **Khmer (Unicode)** text. Most PDF editors break Khmer
 when they write it. This one shapes Khmer correctly and keeps the text searchable and copyable.
 
 ## Why other editors fail on Khmer, and what this does instead
@@ -24,7 +24,7 @@ Lines written by the app also store their own text, font, size and colour, so ed
 ## Features
 
 - Open, view, zoom, and page through PDFs (drag and drop works too), with a page-thumbnail sidebar,
-  recent files and a light/dark interface that follows the Windows setting
+  recent files and a light/dark interface that follows the system setting
 - **Edit Text**: click any line or paragraph and edit it right on the page (Enter = save, Shift+Enter =
   new line, Esc = cancel, clicking elsewhere saves). Text from broken Khmer PDFs is recovered first.
   An edited line keeps the original's width (justified paragraphs keep their right edge). Drag the
@@ -66,19 +66,20 @@ Lines written by the app also store their own text, font, size and colour, so ed
 - **Find** Khmer or English across the document (Ctrl+F)
 - Undo/redo, Save / Save As (saves atomically: never leaves a half-written file)
 - Bundled fonts: the **Khmer OS** family (System, Battambang, Siemreap, Content, Muol…), Battambang
-  and Moul. Khmer fonts installed on Windows
+  and Moul. Khmer fonts installed on the computer
   (Khmer UI, DaunPenh, Khmer OS…) are detected automatically, and any .ttf can be added
 
 ## Development
 
 ```bash
 python -m venv .venv && .venv\Scripts\activate      # Windows
+python3 -m venv .venv && source .venv/bin/activate  # Linux
 pip install -r requirements-dev.txt
 python run.py [file.pdf]
 python -m pytest -q tests
 ```
 
-OCR needs the Tesseract program (the Windows installer bundles it). From source, install it
+OCR needs the Tesseract program (the Windows installer and the Linux AppImage bundle it). From source, install it
 (`sudo apt install tesseract-ocr`, or the UB Mannheim build on Windows) or point
 `KHMERPDF_TESSERACT` at `tesseract.exe`; the OCR tests are skipped without it. The Khmer and English
 language data ship in `khmerpdf/tessdata`.
@@ -115,6 +116,33 @@ pyinstaller --noconfirm khmerpdf.spec
 
 The installer installs per user (no admin needed), adds Start-menu and optional desktop shortcuts,
 and optionally adds KhmerPDF to *Open with* for PDFs without changing the default PDF app.
+
+## Building for Linux
+
+**Automatic (recommended):** push to GitHub. `.github/workflows/build-linux.yml` builds on Ubuntu 22.04
+(so the result runs on Ubuntu 22.04+, Debian 12+, Fedora 36+, Mint 21+ and similar), bundles Tesseract,
+runs the tests, smoke-tests the app and produces:
+
+- `KhmerPDF-<version>-x86_64.AppImage`: one file. Make it executable and run it, nothing to install:
+  `chmod +x KhmerPDF-*.AppImage && ./KhmerPDF-*.AppImage`
+- `KhmerPDF-<version>-linux-x86_64.tar.gz`: the same app as a folder; run `KhmerPDF/KhmerPDF`
+
+Download them from the run's *Artifacts*; pushing a `v*` tag also attaches them to the GitHub Release.
+
+**Manual (on a Linux PC):**
+
+```bash
+sudo apt install tesseract-ocr patchelf libxcb-cursor0
+pip install -r requirements-dev.txt
+installer/linux/bundle-tesseract.sh          # optional, for OCR: copies tesseract into build-deps/
+pyinstaller --noconfirm khmerpdf.spec
+installer/linux/build-appimage.sh 0.5.1      # needs appimagetool on PATH (or APPIMAGETOOL=...)
+```
+
+An AppImage only runs on systems with the same or newer glibc as the PC that built it, so build on
+the oldest distro you want to support. The desktop libraries (X11/Wayland, fonts, D-Bus, printing)
+come from the user's system; file dialogs use the desktop portal, so they look native on GNOME and KDE.
+To add it to the app menu, use a tool such as Gear Lever or AppImageLauncher.
 
 ## Known limitations / roadmap
 
