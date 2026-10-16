@@ -49,12 +49,34 @@ def _norm(name: str) -> str:
 # --------------------------------------------------------------------------
 # Reverse dictionary per reference font
 # --------------------------------------------------------------------------
+CACHE_VERSION = 1  # bump when _build changes in a way the tables below don't show
+
+
+def _cache_dir() -> Path:
+    """Where built reverse dictionaries are kept between runs."""
+    import os
+    if os.environ.get("KHMERPDF_CACHE"):
+        return Path(os.environ["KHMERPDF_CACHE"])
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "KhmerPDF" / "cache"
+    return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "khmerpdf"
+
+
 class GlyphDecoder:
     def __init__(self, path: str):
         self.path = path
-        self.font = hb.Font(hb.Face(Path(path).read_bytes()))
+        data = Path(path).read_bytes()
+        self.font = hb.Font(hb.Face(data))
         self.seq: dict[tuple[int, ...], str] = {}
         self.single: dict[int, str] = {}
+        # Building takes about a second per font; it is kept on disk, keyed by
+        # the font file, the syllable tables and the HarfBuzz version.
+        import hashlib
+        tables = repr((CACHE_VERSION, hb.__version__, CONS, SHIFTERS, VOWELS, COMMON_FINAL, SUBS,
+                       SECOND_SUBS, SIGNS, INDEP, OTHER)).encode()
+        self._cache = _cache_dir() / f"decoder-{hashlib.sha1(data + tables).hexdigest()}.bin"
+        if self._load():
+            return
         self._build()
         self.maxlen = max(len(k) for k in self.seq)
         # Order-insensitive index: Word (Uniscribe) sometimes orders a
@@ -80,6 +102,40 @@ class GlyphDecoder:
         # two syllables.
         self.bases: set[int] = {g[0] for g, t in self.seq.items()
                                 if len(g) == 1 and t and ("\u1780" <= t[0] <= "\u17b3")}
+        self._save()
+
+    _TABLES = ("seq", "single", "bag", "prebase", "bases", "maxlen")
+
+    def _load(self) -> bool:
+        """The tables from the disk cache. marshal reads them ~10x faster than
+        JSON; a checksum guards against a damaged file (marshal isn't meant
+        for data it didn't write itself)."""
+        import hashlib
+        import marshal
+        try:
+            raw = self._cache.read_bytes()
+            digest, payload = raw[:32], raw[32:]
+            if hashlib.sha256(payload).digest() != digest:
+                return False
+            d = marshal.loads(payload)
+            for k in self._TABLES:
+                setattr(self, k, d[k])
+            return bool(self.seq)
+        except (OSError, ValueError, EOFError, KeyError, TypeError):
+            return False
+
+    def _save(self) -> None:
+        import hashlib
+        import marshal
+        import os
+        try:
+            payload = marshal.dumps({k: getattr(self, k) for k in self._TABLES})
+            self._cache.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._cache.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_bytes(hashlib.sha256(payload).digest() + payload)
+            os.replace(tmp, self._cache)  # whole file or nothing, even with two windows open
+        except (OSError, ValueError):
+            pass  # no cache, just slower
 
     def _shape(self, text: str) -> tuple[int, ...]:
         buf = hb.Buffer()

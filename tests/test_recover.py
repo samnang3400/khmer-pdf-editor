@@ -166,3 +166,22 @@ def test_pre_base_vowel_drawn_after_its_consonant():
                         archive=pymupdf.Archive(str(KHMER_OS)))
     page = pymupdf.open(stream=doc.tobytes())[0]
     assert [ln.text for ln in text_lines(page)] == words
+
+
+def test_reverse_dictionary_is_cached_on_disk(tmp_path, monkeypatch):
+    from khmerpdf import recover
+    monkeypatch.setenv("KHMERPDF_CACHE", str(tmp_path))
+    path = str(KHMER_OS / "KhmerOSsys.ttf")
+    built = recover.GlyphDecoder(path)
+    (cache,) = tmp_path.glob("decoder-*.bin")
+    monkeypatch.setattr(recover.GlyphDecoder, "_build", lambda self: pytest.fail("rebuilt"))
+    loaded = recover.GlyphDecoder(path)                         # from the file, not rebuilt
+    for k in recover.GlyphDecoder._TABLES:
+        assert getattr(loaded, k) == getattr(built, k)
+    word = [(g, "") for g in built._shape("ស្រាវជ្រាវ")]
+    assert loaded.decode(word) == "ស្រាវជ្រាវ"
+    cache.write_bytes(cache.read_bytes()[:-10] + b"0123456789")  # damaged: built again, not trusted
+    monkeypatch.undo()
+    monkeypatch.setenv("KHMERPDF_CACHE", str(tmp_path))
+    again = recover.GlyphDecoder(path)
+    assert again.seq == built.seq
