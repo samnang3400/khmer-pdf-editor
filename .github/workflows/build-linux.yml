@@ -69,12 +69,21 @@ jobs:
           chmod +x appimagetool
           APPIMAGETOOL=$PWD/appimagetool installer/linux/build-appimage.sh ${{ steps.ver.outputs.version }}
 
+      - name: Build .deb, and test-install it
+        run: |
+          installer/linux/build-deb.sh ${{ steps.ver.outputs.version }}
+          sudo apt-get install -y ./dist/khmerpdf_*_amd64.deb
+          set +e; QT_QPA_PLATFORM=offscreen timeout 8 khmerpdf; code=$?; set -e
+          if [ "$code" -ne 124 ]; then echo "installed khmerpdf exited early with code $code"; exit 1; fi
+          sudo apt-get remove -y khmerpdf
+
       - uses: actions/upload-artifact@v7
         with:
           name: KhmerPDF-${{ steps.ver.outputs.version }}-linux
           path: |
             dist/KhmerPDF-*.AppImage
             dist/KhmerPDF-*-linux-x86_64.tar.gz
+            dist/khmerpdf_*_amd64.deb
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -83,3 +92,4 @@ jobs:
           files: |
             dist/KhmerPDF-*.AppImage
             dist/KhmerPDF-*-linux-x86_64.tar.gz
+            dist/khmerpdf_*_amd64.deb

@@ -125,6 +125,9 @@ runs the tests, smoke-tests the app and produces:
 
 - `KhmerPDF-<version>-x86_64.AppImage`: one file. Make it executable and run it, nothing to install:
   `chmod +x KhmerPDF-*.AppImage && ./KhmerPDF-*.AppImage`
+- `khmerpdf_<version>_amd64.deb`: for Ubuntu, Mint and Debian. Double-click to install, or
+  `sudo apt install ./khmerpdf_*_amd64.deb`. Installs to `/opt/khmerpdf`, adds the app-menu entry,
+  *Open With* for PDFs and the `khmerpdf` command; remove with `sudo apt remove khmerpdf`
 - `KhmerPDF-<version>-linux-x86_64.tar.gz`: the same app as a folder; run `KhmerPDF/KhmerPDF`
 
 Download them from the run's *Artifacts*; pushing a `v*` tag also attaches them to the GitHub Release.
@@ -137,6 +140,7 @@ pip install -r requirements-dev.txt
 installer/linux/bundle-tesseract.sh          # optional, for OCR: copies tesseract into build-deps/
 pyinstaller --noconfirm khmerpdf.spec
 installer/linux/build-appimage.sh 0.5.2      # needs appimagetool on PATH (or APPIMAGETOOL=...)
+installer/linux/build-deb.sh 0.5.2
 ```
 
 An AppImage only runs on systems with the same or newer glibc as the PC that built it, so build on
