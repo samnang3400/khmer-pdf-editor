@@ -22,6 +22,8 @@ from pathlib import Path
 import pymupdf
 import uharfbuzz as hb
 
+from .legacy import is_limon_font, limon_to_unicode
+
 FONT_DIR = Path(__file__).parent / "fonts"
 
 CONS = [chr(c) for c in range(0x1780, 0x17A3)]
@@ -408,6 +410,8 @@ class FoundLine:
     text: str       # recovered text (== original when nothing to recover)
     recovered: bool  # rebuilt exactly from the glyphs with a matching font
     approx: bool = False  # best-effort repair (no matching font): please check
+    legacy: bool = False  # converted from a Limon (pre-Unicode) font
+    trailing_space: bool = False  # the PDF's text ended with a space
 
 
 def _decode_tokens(tokens: list[tuple[int, str, "MappedDecoder | None"]]) -> tuple[str, float]:
@@ -509,11 +513,17 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = ()) -> list[Fou
     out: list[FoundLine] = []
     for seg in segments:
         gl = seg["glyphs"]
-        original = "".join(g[4] for g in gl).replace("\xa0", " ").strip()
+        raw = "".join(g[4] for g in gl).replace("\xa0", " ")
+        original = raw.strip()
         if not re.sub(r"[\s\u17b6-\u17d3\u17dd\u200b]", "", original):
             continue
         text = original
-        if any(g[8] for g in gl):
+        legacy = any(is_limon_font(g[6]) for g in gl)
+        if legacy:
+            # Limon: convert the font's codes, run by run (Latin words may be in another font)
+            runs = [(k, "".join(g[4] for g in grp)) for k, grp in itertools.groupby(gl, key=lambda g: is_limon_font(g[6]))]
+            text = "".join(limon_to_unicode(t) if k else t for k, t in runs).replace("\xa0", " ").strip()
+        elif any(g[8] for g in gl):
             # Word draws glyphs in visual order; other tools draw them in logical
             # order with explicit positions. Try the drawing order and the
             # left-to-right order; keep whichever matches more known syllables.
@@ -522,7 +532,7 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = ()) -> list[Fou
                 candidates.append(_decode_tokens([(g[3] if g[8] else -1, g[4], g[8]) for g in order]))
             text = min(candidates, key=lambda c: c[1])[0]
         approx = False
-        if text == original and looks_broken(original):
+        if not legacy and text == original and looks_broken(original):
             repaired = repair_visual_order(_visual_order(gl))  # normalise logical-order streams first
             if repaired and repaired != original:
                 text, approx = repaired, True
@@ -531,7 +541,8 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = ()) -> list[Fou
         main = max(set((g[5], g[6], g[7]) for g in bases), key=lambda k: sum(1 for g in bases if (g[5], g[6], g[7]) == k))
         out.append(FoundLine(rect=rect, baseline=seg["baseline"], size=round(main[0] * 2) / 2,
                              font=main[1], color=main[2], original=original, text=text,
-                             recovered=text != original and not approx, approx=approx))
+                             recovered=text != original and not approx, approx=approx,
+                             legacy=legacy, trailing_space=raw != raw.rstrip()))
     return out
 
 

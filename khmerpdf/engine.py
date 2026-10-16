@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+import secrets
+from dataclasses import dataclass, field
+from dataclasses import replace as dataclass_replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -360,14 +362,22 @@ MAX_SQUEEZE = 0.08   # ...using at most ±8% horizontal scaling (beyond word spa
 
 
 def _fit_plan(glyphs: list[Glyph], text: str, scale: float, natural: float,
-              target: float | None) -> tuple[float, dict[int, float]]:
+              target: float | None, justify: bool = False) -> tuple[float, dict[int, float]]:
     """How to make a line exactly `target` wide, like the justified line it
     replaces: (horizontal scale, extra advance per space glyph index).
     Word spacing changes first (spaces can shrink to 30%); a small horizontal
-    scale takes up the rest. No fitting when the text changed length a lot."""
-    if not target or natural <= 0 or abs(target - natural) / target > FIT_RANGE:
+    scale takes up the rest. No fitting when the text changed length a lot.
+    `justify`: a line of a justified paragraph - spaces, and invisible word
+    breaks, grow as much as needed."""
+    if not target or natural <= 0:
         return 1.0, {}
-    spaces = [i for i, g in enumerate(glyphs) if text[g.cluster:g.cluster + 1] in (" ", "\xa0")]
+    gaps = (" ", "\xa0", ZERO_WIDTH[0]) if justify else (" ", "\xa0")
+    spaces = [i for i, g in enumerate(glyphs) if text[g.cluster:g.cluster + 1] in gaps]
+    if justify and spaces and target > natural:
+        each = (target - natural) / len(spaces)
+        return 1.0, {i: each for i in spaces}
+    if abs(target - natural) / target > FIT_RANGE:
+        return 1.0, {}
     extra = target - natural
     per_space: dict[int, float] = {}
     if spaces:
@@ -383,22 +393,25 @@ def _fit_plan(glyphs: list[Glyph], text: str, scale: float, natural: float,
 
 def _write_line(page: pymupdf.Page, font: KhmerFont, text: str, x: float, baseline: float,
                 size: float, color: tuple[float, float, float], to_pdf: pymupdf.Matrix,
-                fit_width: float | None = None) -> pymupdf.Rect:
+                fit_width: float | None = None, visible: bool = True,
+                meta: dict[str, str] | None = None, justify: bool = False) -> pymupdf.Rect:
     """Write one shaped line as its own Form XObject. (x, baseline) are MuPDF
     (top-left origin) coordinates on the unrotated page. With `fit_width`,
-    the line is stretched/squeezed to that width (see _fit_plan)."""
+    the line is stretched/squeezed to that width (see _fit_plan).
+    `visible=False` writes only the invisible text layer (OCR of a scan);
+    `meta` adds keys to the line's dictionary (paragraph, OCR)."""
     doc = page.parent
     glyphs = font.shape(text)
     scale = size / font.upem
     glyph_res: dict[str, int] = {}
     ops = ["q", f"{color[0]:.3f} {color[1]:.3f} {color[2]:.3f} rg"]
     natural = sum(g.x_advance for g in glyphs) * scale
-    sx, per_space = _fit_plan(glyphs, text, scale, natural, fit_width)
+    sx, per_space = _fit_plan(glyphs, text, scale, natural, fit_width, justify)
 
     # 1. visible glyph outlines
     pen = 0.0  # in points, already including spacing adjustments
     for i, g in enumerate(glyphs):
-        glyph = _glyph_xobject(doc, font, g.gid)
+        glyph = _glyph_xobject(doc, font, g.gid) if visible else None
         if glyph:
             name, gx = glyph
             glyph_res[name] = gx
@@ -406,6 +419,8 @@ def _write_line(page: pymupdf.Page, font: KhmerFont, text: str, x: float, baseli
             ops.append(f"q {scale * sx:.6f} 0 0 {scale:.6f} {p.x:.3f} {p.y:.3f} cm /{name} Do Q")
         pen += g.x_advance * scale + per_space.get(i, 0.0)
     width = pen * sx
+    if not visible and fit_width:
+        width = fit_width  # nothing drawn: the text layer simply spans the measured width
 
     # 2. invisible text: ONE run for the whole line, horizontally scaled so it
     #    spans the shaped width. Per-cluster runs line up highlights more
@@ -427,7 +442,8 @@ def _write_line(page: pymupdf.Page, font: KhmerFont, text: str, x: float, baseli
         f"/KhmerPDFLine true /KhmerPDFText {_hex16(text)} /KhmerPDFFont {_hex16(font.name)} "
         f"/KhmerPDFSize {size:g} /KhmerPDFColor [{color[0]:.4f} {color[1]:.4f} {color[2]:.4f}] "
         f"/KhmerPDFRect [{rect.x0:.2f} {rect.y0:.2f} {rect.x1:.2f} {rect.y1:.2f}] "
-        f"/KhmerPDFBaseline {baseline:.2f} >>"), ("\n".join(ops) + "\n").encode())
+        f"/KhmerPDFBaseline {baseline:.2f} "
+        + "".join(f"/{k} {v} " for k, v in (meta or {}).items()) + ">>"), ("\n".join(ops) + "\n").encode())
     _set_resource(form, doc, "Font", "KT", _text_font(doc))
     for name, gx in glyph_res.items():
         _set_resource(form, doc, "XObject", name, gx)
@@ -447,9 +463,15 @@ def insert_khmer_text(page: pymupdf.Page, rect: pymupdf.Rect, text: str,
                       color: tuple[float, float, float] = (0, 0, 0),
                       align: str = "left", wrap_text: bool = True,
                       baseline: float | None = None,
-                      fit_width: float | None = None) -> pymupdf.Rect:
+                      fit_width: float | None = None,
+                      line_step: float | None = None, justify: bool = False,
+                      visible: bool = True, meta: dict[str, str] | None = None) -> pymupdf.Rect:
     """Write shaped, searchable Khmer text into `rect` (page coordinates as
-    displayed). Returns the rect covered by the text."""
+    displayed). Returns the rect covered by the text.
+    Wrapped text is one paragraph: its lines remember the whole text, width,
+    line spacing and justification, so it can be edited, moved and resized
+    as a block. `justify` stretches every line but the last of each paragraph
+    to the full width; `line_step` is the baseline-to-baseline distance."""
     font = font or default_font()
     rect = pymupdf.Rect(rect)
     rotation = page.rotation
@@ -458,20 +480,31 @@ def insert_khmer_text(page: pymupdf.Page, rect: pymupdf.Rect, text: str,
         page.set_rotation(0)
     try:
         to_pdf = ~page.transformation_matrix
-        lines = layout(text, font, size, rect.width if wrap_text else None)
+        step = line_step or font.line_height(size)
+        lines: list[tuple[str, bool]] = []   # (line, ends a paragraph)
+        for part in text.split("\n"):
+            wrapped = layout(part, font, size, rect.width if wrap_text else None)
+            lines += [(ln, i == len(wrapped) - 1) for i, ln in enumerate(wrapped)]
+        if wrap_text:
+            meta = dict(meta or {}, KhmerPDFBlock=f"({secrets.token_hex(6)})",
+                        KhmerPDFBlockText=_hex16(text), KhmerPDFBlockWidth=f"{rect.width:.2f}",
+                        KhmerPDFStep=f"{step:.2f}", KhmerPDFJustify="true" if justify else "false")
         y = baseline if baseline is not None else rect.y0 + font.ascent(size)
         used = pymupdf.Rect()
-        for line in lines:
+        for line, last in lines:
+            stretch = justify and not last
+            target = rect.width if stretch else (fit_width if len(lines) == 1 else None)
             w = font.width(line, size)
+            if target and (stretch or abs(target - w) / target <= FIT_RANGE):
+                w = target  # the line will be fitted to this width
             x = rect.x0
             if align == "center":
                 x = rect.x0 + (rect.width - w) / 2
             elif align == "right":
                 x = rect.x1 - w
             if line.strip(" " + ZERO_WIDTH):
-                used |= _write_line(page, font, line, x, y, size, color, to_pdf,
-                                    fit_width if len(lines) == 1 else None)
-            y += font.line_height(size)
+                used |= _write_line(page, font, line, x, y, size, color, to_pdf, target, visible, meta, stretch)
+            y += step
     finally:
         if rotation:
             page.set_rotation(rotation)
@@ -494,6 +527,19 @@ class TextLine:
     original: str = ""   # what the PDF's own text layer says (may be broken)
     recovered: bool = False  # text was rebuilt from the glyphs with a reference font
     approx: bool = False     # best-effort repair (font unknown): may contain mistakes
+    ocr: bool = False        # recognised by OCR (scan): may contain mistakes
+    legacy: bool = False     # converted from a legacy (Limon) font encoding
+    trailing_space: bool = False  # the line ended with a space (joins paragraphs)
+    block: str = ""          # paragraph id of lines written together by this app
+    block_text: str = ""     # ...that paragraph's whole text, width, spacing, justification
+    block_width: float = 0.0
+    block_step: float = 0.0
+    block_justify: bool = False
+
+    @property
+    def needs_check(self) -> bool:
+        """Text that may contain mistakes (OCR or rule-based repair)."""
+        return self.approx or self.ocr
 
 
 def _own_lines(page: pymupdf.Page) -> list[TextLine]:
@@ -508,9 +554,16 @@ def _own_lines(page: pymupdf.Page) -> list[TextLine]:
         c = tuple(float(v) for v in g("KhmerPDFColor").strip("[]").split())
         if page.rotation:
             r = r * page.rotation_matrix
-        out.append(TextLine(rect=r, text=g("KhmerPDFText"), size=float(g("KhmerPDFSize")),
-                            font=g("KhmerPDFFont"), color=c,
-                            baseline=float(g("KhmerPDFBaseline")), garbled=False, xref=xref))
+        block = g("KhmerPDFBlock")
+        ln = TextLine(rect=r, text=g("KhmerPDFText"), size=float(g("KhmerPDFSize")),
+                      font=g("KhmerPDFFont"), color=c,
+                      baseline=float(g("KhmerPDFBaseline")), garbled=False, xref=xref,
+                      ocr=g("KhmerPDFOCR") == "true")
+        if block and block != "null":
+            ln.block, ln.block_text = block, g("KhmerPDFBlockText")
+            ln.block_width, ln.block_step = float(g("KhmerPDFBlockWidth")), float(g("KhmerPDFStep"))
+            ln.block_justify = g("KhmerPDFJustify") == "true"
+        out.append(ln)
     return out
 
 
@@ -529,8 +582,24 @@ def text_lines(page: pymupdf.Page) -> list[TextLine]:
         found.append(TextLine(rect=f.rect, text=f.text, size=f.size, font=f.font, color=f.color,
                               baseline=f.baseline,
                               garbled=not (f.recovered or f.approx) and looks_broken(f.text),
-                              original=f.original, recovered=f.recovered, approx=f.approx))
+                              original=f.original, recovered=f.recovered, approx=f.approx,
+                              legacy=f.legacy, trailing_space=f.trailing_space))
     return own + found
+
+
+def _background(page: pymupdf.Page, rect: pymupdf.Rect) -> tuple[float, float, float]:
+    """The paper colour around `rect` (median of a thin ring around it)."""
+    try:
+        ring = pymupdf.Rect(rect.x0 - 3, rect.y0 - 3, rect.x1 + 3, rect.y1 + 3) & page.rect
+        pix = page.get_pixmap(clip=ring, dpi=72, alpha=False, colorspace=pymupdf.csRGB)
+        inner = pymupdf.IRect(3, 3, max(pix.width - 3, 3), max(pix.height - 3, 3))
+        px = [pix.pixel(x, y) for y in range(pix.height) for x in range(pix.width)
+              if not (inner.x0 <= x < inner.x1 and inner.y0 <= y < inner.y1)]
+        if not px:
+            return (1.0, 1.0, 1.0)
+        return tuple(sorted(p[i] for p in px)[len(px) // 2] / 255 for i in range(3))
+    except Exception:
+        return (1.0, 1.0, 1.0)
 
 
 def delete_line(page: pymupdf.Page, line: TextLine) -> None:
@@ -539,6 +608,14 @@ def delete_line(page: pymupdf.Page, line: TextLine) -> None:
         # Empty the line's Form XObject: exact, and leaves other content alone.
         doc.update_stream(line.xref, b"")
         doc.xref_set_key(line.xref, "KhmerPDFLine", "false")
+        if not line.ocr:
+            return
+        # OCR text: the visible text is in the scan (or in a broken text layer)
+        # underneath. Paint it out with the paper colour.
+        r = pymupdf.Rect(line.rect.x0 - 1, line.rect.y0 - 1, line.rect.x1 + 1, line.rect.y1 + 1)
+        page.add_redact_annot(r, fill=_background(page, r))
+        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_PIXELS,
+                              graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
         return
     r = pymupdf.Rect(line.rect)
     # Khmer stacks are tall and overlap neighbouring lines; redact a slightly
@@ -578,3 +655,196 @@ def search(page: pymupdf.Page, query: str) -> list[pymupdf.Rect]:
         else:
             merged.append(pymupdf.Rect(r))
     return merged
+
+
+# --------------------------------------------------------------------------
+# Paragraphs: edit, move, resize and delete several lines as one block
+# --------------------------------------------------------------------------
+@dataclass
+class Paragraph:
+    lines: list[TextLine]
+    text: str
+    x: float            # left edge of the text block
+    width: float        # wrap width
+    step: float         # baseline-to-baseline distance
+    justify: bool
+    rect: pymupdf.Rect = field(default_factory=pymupdf.Rect)
+
+    def __post_init__(self):
+        if self.rect.is_empty:
+            self.rect = pymupdf.Rect(self.lines[0].rect)
+            for ln in self.lines[1:]:
+                self.rect |= ln.rect
+
+    @property
+    def first(self) -> TextLine:
+        return self.lines[0]
+
+    @property
+    def garbled(self) -> bool:
+        return any(ln.garbled for ln in self.lines)
+
+    @property
+    def needs_check(self) -> bool:
+        return any(ln.needs_check for ln in self.lines)
+
+
+def _bare(s: str) -> str:
+    return re.sub(r"[\s" + ZERO_WIDTH + "]", "", s)
+
+
+def _joiner(a: TextLine, b: TextLine) -> str:
+    """What stood between two wrapped lines: Khmer wraps between words without
+    a space, unless the line visibly ended with one."""
+    if a.trailing_space or not (a.text and b.text and _is_khmer(a.text[-1]) and _is_khmer(b.text[0])):
+        return " "
+    return ZERO_WIDTH[0]  # invisible word break: the text wraps there again
+
+
+def _continues(p: list[TextLine], ln: TextLine) -> float | None:
+    """Baseline step if `ln` is the next line of the paragraph `p`, else None.
+    Conservative: same style, regular spacing, aligned left edges, and the
+    previous line ran (nearly) to the paragraph's right edge."""
+    last = p[-1]
+    s = last.size
+    if ln.garbled or last.garbled or ln.ocr != last.ocr:
+        return None
+    if norm_font_name(ln.font) != norm_font_name(last.font) or abs(ln.size - s) > 0.6:
+        return None
+    if sum(abs(a - b) for a, b in zip(ln.color, last.color)) > 0.15:
+        return None
+    step = ln.baseline - last.baseline
+    if not 0.9 * s <= step <= 2.6 * s:
+        return None
+    if len(p) > 1 and abs(step - (last.baseline - p[-2].baseline)) > 0.15 * step:
+        return None
+    if len(p) == 1:
+        if not -6 * s <= ln.rect.x0 - last.rect.x0 <= s:   # the first line may be indented
+            return None
+    elif abs(ln.rect.x0 - p[1].rect.x0) > s:
+        return None
+    right = max(max(x.rect.x1 for x in p), ln.rect.x1)
+    if last.rect.x1 < right - 3 * s:                      # the line above ended early
+        return None
+    return step
+
+
+def paragraphs(lines: list[TextLine]) -> list[Paragraph]:
+    """Group a page's lines into paragraphs. Lines this app wrote together keep
+    their exact paragraph; other lines are joined when they clearly flow on."""
+    out: list[Paragraph] = []
+    rest: list[TextLine] = []
+    blocks: dict[str, list[TextLine]] = {}
+    for ln in lines:
+        (blocks.setdefault(ln.block, []) if ln.block else rest).append(ln)
+    for group in blocks.values():
+        group.sort(key=lambda ln: ln.baseline)
+        b = group[0]
+        if _bare(b.block_text) == _bare("".join(ln.text for ln in group)):
+            out.append(Paragraph(group, b.block_text, min(ln.rect.x0 for ln in group),
+                                 b.block_width, b.block_step, b.block_justify))
+        else:  # some of its lines were edited one by one since
+            rest += group
+    open_: list[list[TextLine]] = []
+    for ln in sorted(rest, key=lambda ln: (ln.baseline, ln.rect.x0)):
+        best = None
+        for p in open_:
+            step = _continues(p, ln)
+            if step is not None and (best is None or step < best[0]):
+                best = (step, p)
+        if best:
+            best[1].append(ln)
+        else:
+            open_.append([ln])
+    for p in open_:
+        text = p[0].text
+        for a, b in zip(p, p[1:]):
+            text += _joiner(a, b) + b.text
+        x = min(ln.rect.x0 for ln in p[1:]) if len(p) > 1 else p[0].rect.x0
+        right = max(ln.rect.x1 for ln in p)
+        step = (p[-1].baseline - p[0].baseline) / (len(p) - 1) if len(p) > 1 else 0.0
+        justify = len(p) >= 3 and all(right - ln.rect.x1 <= 0.5 * ln.size for ln in p[:-1])
+        out.append(Paragraph(p, text, x, right - x, step, justify))
+    out.sort(key=lambda para: (para.first.baseline, para.x))
+    return out
+
+
+def delete_paragraph(page: pymupdf.Page, para: Paragraph) -> None:
+    for ln in para.lines:
+        delete_line(page, ln)
+
+
+def write_paragraph(page: pymupdf.Page, para: Paragraph, text: str, font: KhmerFont | None = None,
+                    size: float | None = None, color: tuple[float, float, float] | None = None,
+                    dx: float = 0.0, dy: float = 0.0, width: float | None = None,
+                    scale: float = 1.0) -> pymupdf.Rect:
+    """Replace a paragraph with `text`, re-wrapped inside its own width - or
+    moved by (dx, dy), re-wrapped to a new `width`, or scaled (font size, width
+    and spacing) by `scale`. A one-line paragraph that isn't resized stays one
+    line and keeps its width, like replace_text."""
+    first = para.first
+    size = (size or first.size) * scale
+    font = font or default_font()
+    delete_paragraph(page, para)
+    if not text.strip():
+        return pymupdf.Rect(para.rect)
+    x, baseline = para.x + dx, first.baseline + dy
+    if len(para.lines) == 1 and "\n" not in text and width is None and scale == 1.0:
+        target = pymupdf.Rect(x, first.rect.y0 + dy, page.rect.x1 - 18, first.rect.y1 + dy)
+        return insert_khmer_text(page, target, text, font=font, size=size, color=color or first.color,
+                                 wrap_text=False, baseline=baseline,
+                                 fit_width=first.rect.width if size == first.size else None)
+    w = width if width is not None else para.width * scale
+    step = para.step * size / first.size if para.step else None  # spacing follows the font size
+    target = pymupdf.Rect(x, first.rect.y0 + dy, x + max(w, size), page.rect.y1)
+    return insert_khmer_text(page, target, text, font=font, size=size, color=color or first.color,
+                             baseline=baseline, line_step=step, justify=para.justify)
+
+
+# --------------------------------------------------------------------------
+# OCR: an invisible, searchable text layer over scanned text
+# --------------------------------------------------------------------------
+def _overlap(a: pymupdf.Rect, b: pymupdf.Rect) -> float:
+    inter = pymupdf.Rect(a) & b
+    small = min(abs(a), abs(b))
+    return abs(inter) / small if small > 0 and not inter.is_empty else 0.0
+
+
+def add_ocr_layer(page: pymupdf.Page, ocr_lines: list) -> int:
+    """Add recognised lines (ocr.OcrLine) as invisible text, so a scan becomes
+    searchable and its lines editable. Lines over text the PDF already has
+    right are skipped; earlier OCR of this page is replaced. Returns the
+    number of lines added."""
+    for ln in _own_lines(page):
+        if ln.ocr:
+            delete_line(page, dataclass_replace(ln, ocr=False))  # just the invisible layer
+    good = [ln for ln in text_lines(page) if not (ln.garbled or ln.needs_check)]
+    font = default_font()
+    n = 0
+    for o in ocr_lines:
+        text = o.text.strip()
+        if not text or any(_overlap(o.rect, g.rect) > 0.3 for g in good):
+            continue
+        # size: the line height Tesseract saw, refined by the width the text spans
+        size = o.height / (font.line_height(1) / LINE_SPACING) if o.height else o.rect.height
+        natural = font.width(text, 1)
+        if natural > 0 and 0.6 * size <= o.rect.width / natural <= 1.4 * size:
+            size = o.rect.width / natural
+        size = round(size * 2) / 2 or 1
+        insert_khmer_text(page, pymupdf.Rect(o.rect.x0, o.rect.y0, page.rect.x1, o.rect.y1), text,
+                          font=font, size=size, wrap_text=False, baseline=o.baseline,
+                          fit_width=o.rect.width, visible=False, meta={"KhmerPDFOCR": "true"})
+        n += 1
+    return n
+
+
+# --------------------------------------------------------------------------
+# Legacy fonts
+# --------------------------------------------------------------------------
+def convert_legacy(page: pymupdf.Page, font: KhmerFont | None = None) -> int:
+    """Rewrite every Limon-font line of the page as Unicode Khmer (searchable,
+    copyable), in place and at the same width. Returns the number of lines."""
+    lines = [ln for ln in text_lines(page) if ln.legacy]
+    for ln in lines:
+        replace_text(page, ln, ln.text, font=font)
+    return len(lines)
