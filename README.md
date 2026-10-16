@@ -39,6 +39,11 @@ Lines written by the app also store their own text, font, size and colour, so ed
   **delete** it. Double-click to edit
 - **Pictures** (Select tool): move, resize (corners keep the shape, sides stretch), **Replace Image**
   (or double-click) and delete. A picture shared with other pages (a header logo) only changes on this page
+- **Pages**: insert a blank page, insert the pages of another PDF (merge), extract pages to a new PDF
+  (split), duplicate, delete, rotate and move pages; drag thumbnails to reorder them, Ctrl/Shift-click
+  to work on several pages at once (Pages menu, or right-click the page list)
+- **Print** (Ctrl+P) and **Print Preview**: all pages, the current page, a range or the selected pages;
+  landscape pages are turned to fit the paper
 - **Limon → Unicode**: text in the legacy Limon fonts (Limon S1, R1, F1…) is converted to Unicode Khmer
   when you edit it; **Convert Limon** rewrites all of it in a Unicode font, in place, so it can be
   searched and copied
@@ -105,7 +110,7 @@ and optionally adds KhmerPDF to *Open with* for PDFs without changing the defaul
 
 - **Next:** dictionary-based Khmer word segmentation, so wrapping works without ZWSP; other legacy
   fonts (ABC, Baidok…); using OCR to check text rebuilt without its font
-- **Phase 3:** page operations (merge, split, rotate, reorder), form filling, signatures, annotations
+- **Phase 3:** form filling, signatures, annotations
 - Rotated pages are supported for adding text, but less tested than upright pages
 - Text that moves to make room is redrawn; if its font isn't available it is drawn in the toolbar's font
 - Lines in tables and borderless tables are found from borders and aligned columns; unusual layouts

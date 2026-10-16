@@ -7,6 +7,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 QtTest = pytest.importorskip("PySide6.QtTest")
 from PySide6.QtCore import QPoint, Qt  # noqa: E402
+from PySide6.QtGui import QKeySequence  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from khmerpdf import app as A  # noqa: E402
@@ -291,3 +292,90 @@ def test_select_move_replace_and_delete_a_picture(qapp, tmp_path, monkeypatch):
     assert not c.pics and len(w.undo_stack) == 3
     w.dirty = False
     w.close()
+
+
+# ---- menus, pages, printing --------------------------------------------------
+@pytest.fixture
+def pages_win(qapp, tmp_path):
+    from tests.test_pages import _doc
+    fn = tmp_path / "pages.pdf"
+    _doc(4).save(fn)
+    w = A.MainWindow()
+    w.show()
+    w.open_file(str(fn))
+    yield w
+    w.dirty = False
+    w.close()
+
+
+def _page_labels(w):
+    from tests.test_pages import _labels
+    return _labels(w.doc)
+
+
+def test_menus_have_print_and_page_tools(pages_win):
+    titles = [a.text().replace("&", "") for a in pages_win.menuBar().actions()]
+    assert titles == ["File", "Edit", "View", "Pages", "Tools", "Help"]
+    file_menu = pages_win.menuBar().actions()[0].menu()
+    assert "Print…" in [a.text() for a in file_menu.actions()]
+    assert pages_win.print_act.shortcut() == QKeySequence(QKeySequence.Print)
+
+
+def test_page_operations_and_undo(pages_win, monkeypatch):
+    w = pages_win
+    w.goto(1)
+    w.insert_blank_page()
+    assert _page_labels(w) == ["ទំព័រ 1", "ទំព័រ 2", "", "ទំព័រ 3", "ទំព័រ 4"] and w.page_no == 2
+    assert w.thumbs.count() == 5 and w.page_total.text().strip() == "/ 5"
+    w.undo()
+    assert w.doc.page_count == 4 and w.thumbs.count() == 4
+    w.goto(3)
+    w.move_pages(-1)
+    assert _page_labels(w) == ["ទំព័រ 1", "ទំព័រ 2", "ទំព័រ 4", "ទំព័រ 3"] and w.page_no == 2
+    w.rotate_pages(90)
+    assert w.doc[2].rotation == 90
+    monkeypatch.setattr(A.QMessageBox, "question", lambda *a, **k: A.QMessageBox.Yes)
+    w.thumbs.clearSelection()            # pick pages 1 and 2, as Ctrl-clicks would
+    w.thumbs.item(0).setSelected(True)
+    w.thumbs.item(1).setSelected(True)
+    w.delete_pages()
+    assert _page_labels(w) == ["ទំព័រ 4", "ទំព័រ 3"]
+
+
+def test_drag_thumbnails_to_reorder(pages_win):
+    w = pages_win
+    it = w.thumbs.takeItem(3)            # what a drop does to the list
+    w.thumbs.insertItem(0, it)
+    w.thumbs.reordered.emit()
+    assert _page_labels(w) == ["ទំព័រ 4", "ទំព័រ 1", "ទំព័រ 2", "ទំព័រ 3"]
+
+
+def test_merge_and_extract(pages_win, tmp_path, monkeypatch):
+    from tests.test_pages import _doc
+    w = pages_win
+    other = tmp_path / "other.pdf"
+    _doc(2).save(other)
+    monkeypatch.setattr(A.QFileDialog, "getOpenFileName", lambda *a, **k: (str(other), ""))
+    w.insert_from_pdf()                  # after page 1
+    assert w.doc.page_count == 6 and _page_labels(w)[1:3] == ["ទំព័រ 1", "ទំព័រ 2"]
+    out = tmp_path / "part.pdf"
+    monkeypatch.setattr(A.QInputDialog, "getText", lambda *a, **k: ("4-6", True))
+    monkeypatch.setattr(A.QFileDialog, "getSaveFileName", lambda *a, **k: (str(out), ""))
+    w.extract_pages()
+    from tests.test_pages import _labels
+    assert _labels(pymupdf.open(out)) == ["ទំព័រ 2", "ទំព័រ 3", "ទំព័រ 4"]
+
+
+def test_print_pages(pages_win, tmp_path):
+    from PySide6.QtPrintSupport import QPrinter
+    w = pages_win
+    w.rotate_pages(90)                   # a landscape page prints turned to fit the paper
+    printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+    printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+    out = tmp_path / "printed.pdf"
+    printer.setOutputFileName(str(out))
+    printer.setResolution(100)
+    assert w.paint_pages(printer, [0, 1, 3], progress=False)
+    printed = pymupdf.open(out)
+    assert printed.page_count == 3
+    assert printed[0].get_images()      # each page carries the rendered page

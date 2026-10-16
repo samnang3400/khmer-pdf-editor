@@ -10,14 +10,16 @@ from pathlib import Path
 import pymupdf
 from PySide6.QtCore import QEvent, QEventLoop, QPoint, QPointF, QRect, QRectF, QSettings, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontDatabase, QFontMetricsF,
-                           QGuiApplication, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap)
-from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog,
-                               QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                               QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog,
-                               QPushButton, QScrollArea, QSizePolicy, QSpinBox, QStackedWidget,
-                               QStyleFactory, QToolBar, QToolButton, QVBoxLayout, QWidget)
+                           QGuiApplication, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QTransform)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QColorDialog, QComboBox, QDialog,
+                               QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
+                               QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+                               QPlainTextEdit, QProgressDialog, QPushButton, QScrollArea, QSizePolicy,
+                               QSpinBox, QStackedWidget, QStyle, QStyledItemDelegate, QStyleFactory,
+                               QToolBar, QToolButton, QVBoxLayout, QWidget)
 
 from . import __version__, ocr
+from . import pages as P
 from .recover import page_rules
 from . import theme as T
 from .engine import (Paragraph, Picture, TextLine, add_ocr_layer, bundled_fonts, convert_legacy,
@@ -428,6 +430,68 @@ class PageFrame(QWidget):
 
 
 # --------------------------------------------------------------------------
+# Page thumbnails: drag to reorder, Ctrl/Shift-click to pick several
+# --------------------------------------------------------------------------
+class ThumbList(QListWidget):
+    reordered = Signal()
+
+    def __init__(self):
+        super().__init__(objectName="thumbs")
+        self.setViewMode(QListWidget.ListMode)  # (IconMode drags items around instead of reordering)
+        self.setIconSize(QSize(THUMB_W, int(THUMB_W * 1.42)))
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.setMouseTracking(True)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+
+    def dropEvent(self, e):
+        super().dropEvent(e)
+        self.reordered.emit()
+
+
+class ThumbDelegate(QStyledItemDelegate):
+    """A page picture with its number under it."""
+
+    def __init__(self, win: "MainWindow"):
+        super().__init__(win)
+        self.win = win
+
+    def paint(self, p: QPainter, opt, index):
+        t = self.win.theme
+        r = QRectF(opt.rect).adjusted(8, 3, -8, -3)
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        if opt.state & QStyle.State_Selected:
+            p.setBrush(QColor(t.accent_soft))
+            p.drawRoundedRect(r, 6, 6)
+        elif opt.state & QStyle.State_MouseOver:
+            p.setBrush(QColor(t.hover))
+            p.drawRoundedRect(r, 6, 6)
+        icon = index.data(Qt.DecorationRole)
+        if icon:
+            pm = icon.pixmap(QSize(THUMB_W, int(THUMB_W * 2)))
+            size = pm.deviceIndependentSize()
+            x = r.center().x() - size.width() / 2
+            p.setPen(QPen(QColor(t.border), 1))
+            p.drawRect(QRectF(x - 0.5, r.top() + 5.5, size.width() + 1, size.height() + 1))
+            p.drawPixmap(QPointF(x, r.top() + 6), pm)
+        current = index.row() == self.win.page_no
+        p.setPen(QColor(t.accent if current else t.muted))
+        f = QFont(opt.font)
+        f.setBold(current)
+        p.setFont(f)
+        p.drawText(QRectF(r.left(), r.bottom() - 20, r.width(), 18), Qt.AlignCenter, str(index.row() + 1))
+        p.restore()
+
+    def sizeHint(self, opt, index):
+        hint = index.data(Qt.SizeHintRole)
+        return hint if hint else QSize(THUMB_W + 24, int(THUMB_W * 1.42) + 34)
+
+
+# --------------------------------------------------------------------------
 # Welcome screen and info banner
 # --------------------------------------------------------------------------
 class Welcome(QWidget):
@@ -571,15 +635,13 @@ class MainWindow(QMainWindow):
         self.scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
         self.scroll.viewport().installEventFilter(self)
 
-        self.thumbs = QListWidget(objectName="thumbs")
-        self.thumbs.setViewMode(QListWidget.IconMode)
-        self.thumbs.setFlow(QListWidget.TopToBottom)
-        self.thumbs.setWrapping(False)
-        self.thumbs.setMovement(QListWidget.Static)
-        self.thumbs.setIconSize(QSize(THUMB_W, int(THUMB_W * 1.42)))
+        self.thumbs = ThumbList()
+        self.thumbs.setItemDelegate(ThumbDelegate(self))
         self.thumbs.setFixedWidth(THUMB_W + 44)
-        self.thumbs.setSpacing(2)
         self.thumbs.currentRowChanged.connect(lambda r: r >= 0 and self.goto(r))
+        self.thumbs.reordered.connect(self._thumbs_reordered)
+        self.thumbs.customContextMenuRequested.connect(
+            lambda pos: self.pages_menu.exec(self.thumbs.viewport().mapToGlobal(pos)))
         self._thumb_timer = QTimer(self, interval=5, timeout=self._render_thumbs)
 
         self.banner = Banner()
@@ -607,6 +669,7 @@ class MainWindow(QMainWindow):
 
         self._build_toolbar()
         self._build_statusbar()
+        self._build_menus()
         self.setAcceptDrops(True)
         self.resize(1200, 860)
         self.setMinimumSize(760, 520)
@@ -647,7 +710,7 @@ class MainWindow(QMainWindow):
                                      tb, checkable=True)
         self.sidebar_act.setChecked(True)
         tb.addSeparator()
-        self._act("Open", self.open_dialog, "open", QKeySequence.Open, "Open a PDF", tb)
+        self.open_act = self._act("Open…", self.open_dialog, "open", QKeySequence.Open, "Open a PDF", tb)
         self.save_act = self._act("Save", self.save, "save", QKeySequence.Save, "Save", None)
         self.save_as_act = self._act("Save As…", self.save_as, None, QKeySequence.SaveAs, "Save as a new file")
         save_btn = QToolButton()
@@ -657,6 +720,8 @@ class MainWindow(QMainWindow):
         save_btn.setMenu(menu)
         save_btn.setPopupMode(QToolButton.MenuButtonPopup)
         tb.addWidget(save_btn)
+        self.print_act = self._act("Print…", self.print_document, "print", QKeySequence.Print, "Print", tb)
+        self.preview_act = self._act("Print Preview…", self.print_preview, None, None, "See the pages before printing")
         tb.addSeparator()
         self.undo_act = self._act("Undo", self.undo, "undo", QKeySequence.Undo, tb=tb)
         self.redo_act = self._act("Redo", self.redo, "redo", QKeySequence.Redo, tb=tb)
@@ -811,6 +876,282 @@ class MainWindow(QMainWindow):
         for w in self._nav[4:]:
             sb.addPermanentWidget(w)
 
+    def _build_menus(self):
+        mb = self.menuBar()
+        a = self._act
+        # page operations (Pages menu, and right-click on the page list)
+        self.page_acts = [
+            a("Insert Blank Page", self.insert_blank_page, "pageadd", None, "Add an empty page after this one"),
+            a("Insert Pages from PDF…", self.insert_from_pdf, None, None,
+              "Merge: add the pages of another PDF after this page"),
+            a("Extract Pages…", self.extract_pages, None, None, "Split: save some pages as a new PDF"),
+            a("Duplicate Page", self.duplicate_pages, None, "Ctrl+Shift+D", "Copy the selected pages"),
+            None,
+            a("Rotate Left", lambda: self.rotate_pages(-90), "rotleft", "Ctrl+[", "Turn the page left"),
+            a("Rotate Right", lambda: self.rotate_pages(90), "rotright", "Ctrl+]",
+              "Turn the page right"),
+            None,
+            a("Move Page Up", lambda: self.move_pages(-1), None, "Ctrl+Shift+Up", "Move the page one place earlier"),
+            a("Move Page Down", lambda: self.move_pages(1), None, "Ctrl+Shift+Down", "Move the page one place later"),
+            None,
+            a("Delete Page…", self.delete_pages, None, None, "Remove the selected pages"),
+        ]
+        self.about_act = a("About KhmerPDF Editor", self.about)
+        self.quit_act = a("Quit", self.close, None, QKeySequence.Quit)
+        self.zoom_in_act = a("Zoom In", lambda: self.set_zoom(self.zoom * 1.2))
+        self.zoom_out_act = a("Zoom Out", lambda: self.set_zoom(self.zoom / 1.2))
+        self.zoom_100_act = a("Actual Size", lambda: self.set_zoom(1.0), None, "Ctrl+0")
+        self.fit_act = a("Fit Width", self.fit_width)
+        self.find_act = a("Find…", lambda: (self.find_box.setFocus(), self.find_box.selectAll()))
+        self.find_act.setShortcut("")  # Ctrl+F is already on another action; just show it
+        self.find_act.setText("Find…\tCtrl+F")
+
+        def menu(title, items):
+            m = mb.addMenu(title)
+            for item in items:
+                if item is None:
+                    m.addSeparator()
+                elif isinstance(item, QMenu):
+                    m.addMenu(item)
+                else:
+                    m.addAction(item)
+            return m
+
+        self.recent_menu = QMenu("Open Recent")
+        self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
+        menu("&File", [self.open_act, self.recent_menu, None, self.save_act, self.save_as_act, None,
+                       self.print_act, self.preview_act, None, self.quit_act])
+        menu("&Edit", [self.undo_act, self.redo_act, None, self.find_act, self.delete_act, self.replace_img_act])
+        menu("&View", [self.sidebar_act, None, self.zoom_in_act, self.zoom_out_act, self.zoom_100_act,
+                       self.fit_act])
+        self.pages_menu = menu("&Pages", self.page_acts)
+        menu("&Tools", [*self.mode_actions.values(), None, self.insert_zwsp_act, None, self.ocr_act,
+                        self.ocr_all_act, self.limon_act])
+        menu("&Help", [self.about_act])
+
+    def _fill_recent_menu(self):
+        self.recent_menu.clear()
+        for path in self._recent():
+            self.recent_menu.addAction(Path(path).name, lambda p=path: self._open_recent(p)).setToolTip(path)
+        if self.recent_menu.isEmpty():
+            self.recent_menu.addAction("(none)").setEnabled(False)
+
+    def about(self):
+        QMessageBox.about(self, f"About {APP_NAME}",
+                          f"<b>{APP_NAME}</b> {__version__}<br><br>A PDF editor built for Khmer text: correct "
+                          "shaping, searchable text, recovery of broken Khmer PDFs, Limon conversion and OCR."
+                          "<br><br>Footprints International School<br><br>"
+                          "<small>Built with PyMuPDF (AGPL), Qt for Python, HarfBuzz and Tesseract OCR. "
+                          "Fonts: Khmer OS (LGPL), Battambang and Moul (OFL).</small>")
+
+    # ---- pages ------------------------------------------------------------
+    def _selected_pages(self) -> list[int]:
+        """The pages picked in the page list (Ctrl/Shift-click), else this page."""
+        rows = sorted(i.row() for i in self.thumbs.selectedIndexes())
+        return rows if len(rows) > 1 else [self.page_no]
+
+    def _pages_changed(self, select: list[int] | None = None):
+        """After pages were added, removed or moved."""
+        n = self.doc.page_count
+        self.page_no = min(select[0] if select else self.page_no, n - 1)
+        self.page_spin.blockSignals(True)
+        self.page_spin.setMaximum(n)
+        self.page_spin.blockSignals(False)
+        self.page_total.setText(f" / {n} ")
+        self.dirty = True
+        self.search_hits = []
+        self.canvas.selected = None
+        self._rebuild_thumbs()
+        if select and len(select) > 1:
+            for r in select:
+                self.thumbs.item(r).setSelected(True)
+        self.render()
+        self._refresh_undo_actions()
+
+    def _page_op(self, op, done: str, select=None) -> bool:
+        """Run a page operation as one undo step. `op(doc)` returns what
+        `select(result)` turns into the pages to show/select afterwards."""
+        if not self.doc:
+            return False
+        self._close_inline(save=True)
+        self._snapshot()
+        try:
+            result = op(self.doc)
+        except ValueError as exc:
+            self.undo_stack.pop()
+            QMessageBox.information(self, APP_NAME, str(exc))
+            return False
+        except Exception as exc:
+            self._restore(self.undo_stack.pop())
+            self._pages_changed()
+            QMessageBox.critical(self, APP_NAME, f"Could not change the pages:\n{exc}")
+            return False
+        self._pages_changed(select(result) if select else None)
+        self.statusBar().showMessage(done + " (Ctrl+Z to undo)", 5000)
+        return True
+
+    def insert_blank_page(self):
+        self._page_op(lambda d: P.insert_blank(d, self.page_no + 1, like=self.page_no), "Blank page added",
+                      lambda n: [n])
+
+    def insert_from_pdf(self):
+        if not self.doc:
+            return
+        start = str(Path(self.path).parent) if self.path else ""
+        path, _ = QFileDialog.getOpenFileName(self, "Insert pages from PDF", start, "PDF files (*.pdf)")
+        if not path:
+            return
+        try:
+            src = pymupdf.open(stream=Path(path).read_bytes(), filetype="pdf")
+            if src.needs_pass:
+                raise ValueError("Password-protected PDFs are not supported yet.")
+        except Exception as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not open the file:\n{exc}")
+            return
+        at = self.page_no + 1
+        self._page_op(lambda d: P.insert_pdf(d, src, at), f"Added {src.page_count} page(s) from {Path(path).name}",
+                      lambda n: [at])
+
+    def extract_pages(self):
+        if not self.doc:
+            return
+        text, ok = QInputDialog.getText(self, "Extract pages", f"Pages to save as a new PDF (1-{self.doc.page_count}), "
+                                        "e.g. 1-3, 5:", text=P.describe(self._selected_pages()))
+        if not ok:
+            return
+        try:
+            pages = P.parse_ranges(text, self.doc.page_count)
+        except ValueError as exc:
+            QMessageBox.information(self, APP_NAME, str(exc))
+            return
+        stem = Path(self.path).stem if self.path else "document"
+        start = str(Path(self.path).with_name(f"{stem} (pages {P.describe(pages)}).pdf")) if self.path else ""
+        path, _ = QFileDialog.getSaveFileName(self, "Save extracted pages", start, "PDF files (*.pdf)")
+        if not path:
+            return
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+        try:
+            P.extract(self.doc, pages).save(path, garbage=3, deflate=True)
+        except Exception as exc:
+            QMessageBox.critical(self, APP_NAME, f"Could not save:\n{exc}")
+            return
+        self.statusBar().showMessage(f"Saved {len(pages)} page(s) to {path}", 6000)
+
+    def duplicate_pages(self):
+        pages = self._selected_pages()
+        self._page_op(lambda d: P.duplicate(d, pages), f"Duplicated {len(pages)} page(s)", lambda new: new)
+
+    def delete_pages(self):
+        if not self.doc:
+            return
+        pages = self._selected_pages()
+        what = f"page {pages[0] + 1}" if len(pages) == 1 else f"{len(pages)} pages ({P.describe(pages)})"
+        if QMessageBox.question(self, APP_NAME, f"Delete {what}?") != QMessageBox.Yes:
+            return
+        self._page_op(lambda d: P.delete(d, pages), f"Deleted {what}", lambda _: [min(pages)])
+
+    def rotate_pages(self, degrees: int):
+        pages = self._selected_pages()
+        self._page_op(lambda d: P.rotate(d, pages, degrees), f"Rotated {len(pages)} page(s)", lambda _: pages)
+
+    def move_pages(self, step: int):
+        pages = self._selected_pages()
+        self._page_op(lambda d: P.move(d, pages, step), "Moved", lambda new: new)
+
+    def _thumbs_reordered(self):
+        order = [self.thumbs.item(i).data(Qt.UserRole) for i in range(self.thumbs.count())]
+        if order == list(range(len(order))):
+            return
+        current = order.index(self.page_no)
+        self._page_op(lambda d: P.reorder(d, order), "Pages reordered", lambda _: [current])
+
+    # ---- printing -----------------------------------------------------------
+    def print_document(self):
+        if not self.doc:
+            return
+        from PySide6.QtPrintSupport import QAbstractPrintDialog, QPrintDialog, QPrinter
+        self._close_inline(save=True)
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setDocName(Path(self.path).name if self.path else APP_NAME)
+        dlg = QPrintDialog(printer, self)
+        dlg.setMinMax(1, self.doc.page_count)
+        opts = QAbstractPrintDialog.PrintDialogOption
+        dlg.setOption(opts.PrintPageRange, True)
+        dlg.setOption(opts.PrintCurrentPage, True)
+        dlg.setOption(opts.PrintSelection, len(self._selected_pages()) > 1)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        pages = self._pages_to_print(printer)
+        if self.paint_pages(printer, pages):
+            self.statusBar().showMessage(f"Sent {len(pages)} page(s) to the printer", 5000)
+
+    def print_preview(self):
+        if not self.doc:
+            return
+        from PySide6.QtPrintSupport import QPrinter, QPrintPreviewDialog
+        self._close_inline(save=True)
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        dlg = QPrintPreviewDialog(printer, self)
+        dlg.setWindowTitle(f"Print Preview — {APP_NAME}")
+        dlg.paintRequested.connect(lambda pr: self.paint_pages(pr, self._pages_to_print(pr), progress=False))
+        dlg.resize(1000, 800)
+        dlg.exec()
+
+    def _pages_to_print(self, printer) -> list[int]:
+        from PySide6.QtPrintSupport import QPrinter
+        n = self.doc.page_count
+        mode = printer.printRange()
+        if mode == QPrinter.PrintRange.CurrentPage:
+            return [self.page_no]
+        if mode == QPrinter.PrintRange.Selection:
+            return self._selected_pages()
+        if mode == QPrinter.PrintRange.PageRange and printer.fromPage() > 0:
+            return list(range(printer.fromPage() - 1, min(printer.toPage(), n)))
+        return list(range(n))
+
+    def paint_pages(self, printer, pages: list[int], progress: bool = True) -> bool:
+        """Draw pages onto a printer (or preview): each rendered at the printer's
+        resolution (at most 300 dpi), fitted to the paper, turned to match the
+        paper's orientation."""
+        painter = QPainter()
+        if not painter.begin(printer):
+            QMessageBox.critical(self, APP_NAME, "Could not start printing.")
+            return False
+        dpi = min(printer.resolution(), 300)
+        box = None
+        if progress and len(pages) > 2:
+            box = QProgressDialog("Printing…", "Cancel", 0, len(pages), self)
+            box.setWindowModality(Qt.WindowModal)
+            box.setMinimumDuration(400)
+        try:
+            for i, n in enumerate(pages):
+                if box:
+                    box.setValue(i)
+                    if box.wasCanceled():
+                        break
+                if i:
+                    printer.newPage()
+                pix = self.doc[n].get_pixmap(dpi=dpi, alpha=False)
+                img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()
+                area = QRectF(painter.viewport())
+                if (img.width() > img.height()) != (area.width() > area.height()):
+                    img = img.transformed(QTransform().rotate(90))  # landscape page on portrait paper
+                k = min(area.width() / img.width(), area.height() / img.height())
+                w, h = img.width() * k, img.height() * k
+                painter.save()
+                painter.resetTransform()
+                painter.setViewport(painter.viewport())
+                painter.setWindow(painter.viewport())
+                painter.drawImage(QRectF(area.x() + (area.width() - w) / 2, area.y() + (area.height() - h) / 2, w, h),
+                                  img)
+                painter.restore()
+        finally:
+            painter.end()
+            if box:
+                box.close()
+        return True
+
     def apply_theme(self, t: T.Theme):
         self.theme = t
         app = QApplication.instance()
@@ -829,7 +1170,8 @@ class MainWindow(QMainWindow):
 
     def _doc_controls(self, on: bool):
         for a in (self.save_act, self.save_as_act, self.ocr_act, self.ocr_all_act, self.limon_act,
-                  *self.mode_actions.values()):
+                  self.print_act, self.preview_act, *self.mode_actions.values(),
+                  *[x for x in getattr(self, "page_acts", []) if x]):
             a.setEnabled(on)
         for w in self._nav + self._nav_gaps:
             w.setVisible(on)
@@ -1015,16 +1357,16 @@ class MainWindow(QMainWindow):
         self.thumbs.clear()
         blank: dict[tuple[int, int], QIcon] = {}
         for i in range(self.doc.page_count):
-            it = QListWidgetItem(str(i + 1))
-            it.setTextAlignment(Qt.AlignHCenter)
+            it = QListWidgetItem()
+            it.setData(Qt.UserRole, i)  # the page it shows, to read a new order after a drag
             r = self.doc[i].rect
             size = (THUMB_W, max(int(THUMB_W * r.height / r.width), 1))
+            it.setSizeHint(QSize(THUMB_W + 24, size[1] + 34))
             if size not in blank:  # a white page until its picture is ready, so the list doesn't jump
                 pm = QPixmap(*size)
                 pm.fill(QColor("white"))
                 blank[size] = QIcon(pm)
             it.setIcon(blank[size])
-            it.setSizeHint(QSize(THUMB_W + 16, int(THUMB_W * 1.42) + 30))
             self.thumbs.addItem(it)
         self.thumbs.setCurrentRow(self.page_no)
         self.thumbs.blockSignals(False)
@@ -1393,6 +1735,10 @@ class MainWindow(QMainWindow):
         old_count = self.doc.page_count if self.doc else 0
         self.doc = pymupdf.open(stream=data, filetype="pdf")
         self.page_no = min(page_no, self.doc.page_count - 1)
+        self.page_spin.blockSignals(True)
+        self.page_spin.setMaximum(self.doc.page_count)
+        self.page_spin.blockSignals(False)
+        self.page_total.setText(f" / {self.doc.page_count} ")
         if self.doc.page_count != old_count:
             self._rebuild_thumbs()
 

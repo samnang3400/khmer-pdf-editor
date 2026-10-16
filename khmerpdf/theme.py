@@ -112,6 +112,9 @@ def stylesheet(t: Theme) -> str:
     QFrame#banner {{ background: {t.info_soft}; border: none; border-bottom: 1px solid {t.border}; }}
     QFrame#banner[kind="warning"] {{ background: {t.warning_soft}; }}
     QFrame#card {{ background: {t.surface}; border: 1px solid {t.border}; border-radius: 12px; }}
+    QMenuBar {{ background: {t.surface}; color: {t.text}; border-bottom: 1px solid {t.border}; padding: 2px 4px; }}
+    QMenuBar::item {{ padding: 4px 10px; border-radius: 4px; background: transparent; }}
+    QMenuBar::item:selected {{ background: {t.hover}; }}
     QMenu {{ background: {t.raised}; color: {t.text}; border: 1px solid {t.border}; padding: 4px; }}
     QMenu::item {{ padding: 6px 22px 6px 12px; border-radius: 4px; }}
     QMenu::item:selected {{ background: {t.accent_soft}; color: {t.text}; }}
@@ -159,6 +162,11 @@ _ICONS = {
                 '<path d="M14 3.5V8h4.5"/><path d="M9 13h6"/><path d="M9 16.5h4"/>',
     "image": '<rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><circle cx="9" cy="10" r="1.7"/>'
              '<path d="m20.5 15.5-4.5-4.5-8.5 8.5"/>',
+    "print": '<path d="M7 9V4h10v5"/><rect x="3.5" y="9" width="17" height="8" rx="2"/><path d="M7 14h10v6.5H7z"/>',
+    "pageadd": '<path d="M14 3.5H7.5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V8z"/><path d="M14 3.5V8h4.5"/>'
+               '<path d="M12 11v6"/><path d="M9 14h6"/>',
+    "rotleft": '<path d="M4 4.5V9h4.5"/><path d="M4.8 9A8 8 0 1 1 6 16.5"/>',
+    "rotright": '<path d="M20 4.5V9h-4.5"/><path d="M19.2 9A8 8 0 1 0 18 16.5"/>',
     "close": '<path d="M6 6l12 12"/><path d="M18 6 6 18"/>',
     "check": '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
 }
