@@ -136,7 +136,7 @@ sudo apt install tesseract-ocr patchelf libxcb-cursor0
 pip install -r requirements-dev.txt
 installer/linux/bundle-tesseract.sh          # optional, for OCR: copies tesseract into build-deps/
 pyinstaller --noconfirm khmerpdf.spec
-installer/linux/build-appimage.sh 0.5.1      # needs appimagetool on PATH (or APPIMAGETOOL=...)
+installer/linux/build-appimage.sh 0.5.2      # needs appimagetool on PATH (or APPIMAGETOOL=...)
 ```
 
 An AppImage only runs on systems with the same or newer glibc as the PC that built it, so build on
