@@ -567,15 +567,16 @@ def _own_lines(page: pymupdf.Page) -> list[TextLine]:
     return out
 
 
-def text_lines(page: pymupdf.Page) -> list[TextLine]:
+def text_lines(page: pymupdf.Page, rules=None) -> list[TextLine]:
     """Lines written by this app (exact text/font/size) + other text on the page.
     Other text is recovered from its glyphs when the PDF's own text layer is
-    broken and a matching reference font is available (see recover.py)."""
+    broken and a matching reference font is available (see recover.py).
+    `rules`: the page's ruling lines (recover.page_rules), if already known."""
     from .recover import find_lines, looks_broken
 
     own = _own_lines(page)
     found = []
-    for f in find_lines(page, skip_fonts=(TEXT_FONT,)):
+    for f in find_lines(page, skip_fonts=(TEXT_FONT,), rules=rules):
         centre = (f.rect.tl + f.rect.br) / 2
         if any(centre in o.rect for o in own):
             continue
@@ -701,13 +702,19 @@ def _joiner(a: TextLine, b: TextLine) -> str:
     return ZERO_WIDTH[0]  # invisible word break: the text wraps there again
 
 
-def _continues(p: list[TextLine], ln: TextLine) -> float | None:
+def _continues(p: list[TextLine], ln: TextLine, rules=None, cells: set[int] = frozenset()) -> float | None:
     """Baseline step if `ln` is the next line of the paragraph `p`, else None.
     Conservative: same style, regular spacing, aligned left edges, and the
-    previous line ran (nearly) to the paragraph's right edge."""
+    previous line ran (nearly) to the paragraph's right edge. Never across a
+    ruling line, and never between two table cells."""
     last = p[-1]
     s = last.size
     if ln.garbled or last.garbled or ln.ocr != last.ocr:
+        return None
+    if id(last) in cells and id(ln) in cells:
+        return None
+    if rules is not None and rules.horizontal_between(last.baseline, ln.baseline - 0.5 * ln.size,
+                                                      min(last.rect.x0, ln.rect.x0), max(last.rect.x1, ln.rect.x1)):
         return None
     if norm_font_name(ln.font) != norm_font_name(last.font) or abs(ln.size - s) > 0.6:
         return None
@@ -723,15 +730,39 @@ def _continues(p: list[TextLine], ln: TextLine) -> float | None:
             return None
     elif abs(ln.rect.x0 - p[1].rect.x0) > s:
         return None
+    # the line above ended early, though the next line's first word would
+    # have fitted: the paragraph ended there (Khmer words are long, so a
+    # ragged line can end well short of the edge)
     right = max(max(x.rect.x1 for x in p), ln.rect.x1)
-    if last.rect.x1 < right - 3 * s:                      # the line above ended early
+    first = re.split(r"[ \u200b]", ln.text.strip(), maxsplit=1)[0]
+    fits = min(ln.rect.width * len(first) / max(len(ln.text), 1), 6 * s)
+    if right - last.rect.x1 > fits + s:
         return None
     return step
 
 
-def paragraphs(lines: list[TextLine]) -> list[Paragraph]:
+def _table_cells(lines: list[TextLine]) -> set[int]:
+    """Lines that look like table cells: short, with other text beside them on
+    the same baseline. (Long lines side by side are columns of prose.)"""
+    out = set()
+    for a in lines:
+        if a.rect.width >= 20 * a.size:
+            continue
+        if any(b is not a and abs(b.baseline - a.baseline) < 1 and (b.rect.x0 >= a.rect.x1 or b.rect.x1 <= a.rect.x0)
+               for b in lines):
+            out.add(id(a))
+    return out
+
+
+def paragraphs(lines: list[TextLine], page: pymupdf.Page | None = None, rules=None) -> list[Paragraph]:
     """Group a page's lines into paragraphs. Lines this app wrote together keep
-    their exact paragraph; other lines are joined when they clearly flow on."""
+    their exact paragraph; other lines are joined when they clearly flow on.
+    With the page (or its ruling lines, recover.page_rules), table borders
+    keep cells apart."""
+    if rules is None and page is not None:
+        from .recover import page_rules
+        rules = page_rules(page)
+    cells = _table_cells(lines)
     out: list[Paragraph] = []
     rest: list[TextLine] = []
     blocks: dict[str, list[TextLine]] = {}
@@ -749,7 +780,7 @@ def paragraphs(lines: list[TextLine]) -> list[Paragraph]:
     for ln in sorted(rest, key=lambda ln: (ln.baseline, ln.rect.x0)):
         best = None
         for p in open_:
-            step = _continues(p, ln)
+            step = _continues(p, ln, rules, cells)
             if step is not None and (best is None or step < best[0]):
                 best = (step, p)
         if best:
@@ -812,18 +843,28 @@ def _overlap(a: pymupdf.Rect, b: pymupdf.Rect) -> float:
 
 def add_ocr_layer(page: pymupdf.Page, ocr_lines: list) -> int:
     """Add recognised lines (ocr.OcrLine) as invisible text, so a scan becomes
-    searchable and its lines editable. Lines over text the PDF already has
-    right are skipped; earlier OCR of this page is replaced. Returns the
-    number of lines added."""
+    searchable and its lines editable. Earlier OCR of this page is replaced.
+    Only text that needs it is added: on a scan, and over text the PDF has
+    broken - never over text it already has right, and never over pictures
+    (photos, logos), which stay pictures. Returns the number of lines added."""
+    from .ocr import looks_like_text, page_images
     for ln in _own_lines(page):
         if ln.ocr:
             delete_line(page, dataclass_replace(ln, ocr=False))  # just the invisible layer
-    good = [ln for ln in text_lines(page) if not (ln.garbled or ln.needs_check)]
+    lines = text_lines(page)
+    good = [ln for ln in lines if not (ln.garbled or ln.needs_check)]
+    broken = [ln for ln in lines if ln.garbled or ln.approx]
+    scans, pictures = page_images(page)
     font = default_font()
     n = 0
+    heights = sorted(o.rect.height for o in ocr_lines) or [0]
     for o in ocr_lines:
         text = o.text.strip()
-        if not text or any(_overlap(o.rect, g.rect) > 0.3 for g in good):
+        if not looks_like_text(text) or o.rect.height < max(4.0, 0.4 * heights[len(heights) // 2]):
+            continue  # junk: symbols, or specks too small to be a line of text
+        if any(_overlap(o.rect, r) > 0.3 for r in pictures + [g.rect for g in good]):
+            continue
+        if not any(_overlap(o.rect, r) > 0.5 for r in scans) and not any(_overlap(o.rect, b.rect) > 0.3 for b in broken):
             continue
         # size: the line height Tesseract saw, refined by the width the text spans
         size = o.height / (font.line_height(1) / LINE_SPACING) if o.height else o.rect.height

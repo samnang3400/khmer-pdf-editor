@@ -195,3 +195,20 @@ def test_ocr_from_the_banner(qapp, tmp_path):
     assert len([ln for ln in w.canvas.lines if ln.ocr]) == 3 and w.banner.kind == "check"
     w.dirty = False
     w.close()
+
+
+def test_clicking_a_table_cell_edits_just_that_cell(qapp, tmp_path):
+    from tests.test_paragraphs import CELLS, _table_pdf
+    fn = tmp_path / "table.pdf"
+    _table_pdf().parent.save(fn)
+    w = A.MainWindow()
+    w.show()
+    w.open_file(str(fn))
+    w.set_mode("edit")
+    c = w.canvas
+    cell = next(ln for ln in c.lines if ln.text == "សុខ ដារា")
+    QTest.mouseClick(c, Qt.LeftButton, pos=QPoint(int((cell.rect.x0 + 5) * c.scale), int((cell.baseline - 3) * c.scale)))
+    assert w.inline["kind"] == "edit" and w.inline["editor"].toPlainText() == CELLS[1][1]
+    w._close_inline(save=False)
+    w.dirty = False
+    w.close()

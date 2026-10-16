@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDoubleSpi
                                QStyleFactory, QToolBar, QToolButton, QVBoxLayout, QWidget)
 
 from . import __version__, ocr
+from .recover import page_rules
 from . import theme as T
 from .engine import (Paragraph, TextLine, add_ocr_layer, bundled_fonts, convert_legacy, delete_paragraph,
                      insert_khmer_text, load_font, match_font, paragraphs, replace_text, search,
@@ -527,7 +528,7 @@ class MainWindow(QMainWindow):
         self.thumbs.setFixedWidth(THUMB_W + 44)
         self.thumbs.setSpacing(2)
         self.thumbs.currentRowChanged.connect(lambda r: r >= 0 and self.goto(r))
-        self._thumb_timer = QTimer(self, interval=0, timeout=self._render_thumbs)
+        self._thumb_timer = QTimer(self, interval=5, timeout=self._render_thumbs)
 
         self.banner = Banner()
         self.banner.close_btn.clicked.connect(self._dismiss_banner)
@@ -909,8 +910,9 @@ class MainWindow(QMainWindow):
         key = self._select_key or (self._key(self.canvas.selected) if self.canvas.selected else None)
         self._select_key = None
         self.canvas.highlights = [r for n, r in self.search_hits if n == self.page_no]
-        lines = text_lines(page)
-        self.canvas.set_page(qpix, scale, lines, paragraphs(lines))
+        rules = page_rules(page)  # table borders keep cells apart
+        lines = text_lines(page, rules)
+        self.canvas.set_page(qpix, scale, lines, paragraphs(lines, rules=rules))
         if key and self.canvas.mode == "select":
             self.canvas.selected = next((p for p in self.canvas.paras if abs(p.x - key[0]) < 2
                                          and abs(p.first.baseline - key[1]) < 1.5), None)
@@ -973,12 +975,12 @@ class MainWindow(QMainWindow):
         if not self.doc or not self._thumb_queue:
             self._thumb_timer.stop()
             return
-        for _ in range(3):
-            if not self._thumb_queue:
-                break
-            n = self._thumb_queue.pop(0)
-            if n >= self.doc.page_count or n >= self.thumbs.count():
-                continue
+        # one page per tick, ones in view first, so the window stays responsive
+        view = self.thumbs.viewport().rect()
+        n = next((n for n in self._thumb_queue if n < self.thumbs.count()
+                  and self.thumbs.visualItemRect(self.thumbs.item(n)).intersects(view)), self._thumb_queue[0])
+        self._thumb_queue.remove(n)
+        if n < self.doc.page_count and n < self.thumbs.count():
             page = self.doc[n]
             dpr = self.devicePixelRatioF()
             z = THUMB_W * dpr / page.rect.width

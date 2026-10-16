@@ -1,4 +1,6 @@
 """Recovering real text from PDFs whose Khmer text layer is broken."""
+from pathlib import Path
+
 import pymupdf
 import pytest
 
@@ -100,6 +102,22 @@ def test_recovers_renamed_and_renumbered_fonts(font_file):
     assert [ln.text for ln in text_lines(page)] == LINES
 
 
+def test_only_the_matching_font_gets_a_reverse_dictionary(monkeypatch):
+    """Building a font's reverse dictionary takes about a second: candidate
+    fonts rejected by their outlines must not get one (opening was slow)."""
+    from khmerpdf import recover
+    built = []
+    real = recover.decoder
+    monkeypatch.setattr(recover, "decoder", lambda path: built.append(path) or real(path))
+    doc = _broken_pdf("KhmerOScontent.ttf")
+    for xref in range(1, doc.xref_length()):  # renamed: every candidate font is tried
+        if doc.xref_get_key(xref, "BaseFont")[0] == "name":
+            doc.xref_set_key(xref, "BaseFont", "/ABCDEF+F1")
+    page = pymupdf.open(stream=doc.tobytes())[0]
+    assert [ln.text for ln in text_lines(page)] == LINES
+    assert {Path(p).name for p in built} == {"KhmerOScontent.ttf"}
+
+
 def test_tolerates_glyph_order_differences():
     """Word (Uniscribe) can order a syllable's marks differently from HarfBuzz;
     that used to leave a stray ្ in the text."""
@@ -136,3 +154,15 @@ def test_repair_visual_order_rules():
     assert repair_visual_order([g("្", 4), g("ក"), g("ម")]) == "ក្រម"     # pre-base ro
     assert repair_visual_order([g("េ"), g("ល"), g("ា")]) == "លោ"           # split vowel
     assert repair_visual_order([g("ǒ"), g("ថ"), g("ប"), g("័", 0), g("ន")]) == "ថប័ន"  # junk dropped
+
+
+def test_pre_base_vowel_drawn_after_its_consonant():
+    """Tools that draw ហ then េ (placed to its left) must not decode as ហ + ងេ."""
+    words = ["ម៉េង", "ម៉ោង", "លី ម៉េង", "ហេង", "សេង ហេង", "ការប្រកាសព័ត៌មាន ហេង"]
+    doc = pymupdf.open()
+    page = doc.new_page()
+    css = "@font-face{font-family:K;src:url(KhmerOSbattambang.ttf);} body{font-family:K;font-size:15px}"
+    page.insert_htmlbox(pymupdf.Rect(50, 50, 500, 700), "<br>".join(words), css=css,
+                        archive=pymupdf.Archive(str(KHMER_OS)))
+    page = pymupdf.open(stream=doc.tobytes())[0]
+    assert [ln.text for ln in text_lines(page)] == words

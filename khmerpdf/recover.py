@@ -16,7 +16,7 @@ from __future__ import annotations
 import itertools
 import re
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from pathlib import Path
 
 import pymupdf
@@ -290,7 +290,6 @@ class MappedDecoder:
 
     def __init__(self, path: str, emb: hb.Font):
         self.path = path
-        self.dec = decoder(path)
         self.emb = emb
         self.mapping: dict[int, tuple[int, ...]] = {}
         self.same_ids = True
@@ -318,10 +317,16 @@ class MappedDecoder:
         # kept the font's own glyph IDs, keep theirs too (drawn glyphs that
         # didn't match stay unmapped: their outline says they're different)
         if self.same_ids:
-            n = self.dec.font.face.glyph_count
+            n = _ref_font(self.path).face.glyph_count
             self.mapping.update({g: (g,) for g in new
                                  if g not in self.mapping and g < n and not _outlines(self.emb, g)})
         return True
+
+    @cached_property
+    def dec(self) -> "GlyphDecoder":
+        # built on first use: it takes about a second, and most candidate
+        # fonts are rejected by their outlines before it is needed
+        return decoder(self.path)
 
     def _rank(self, g: int) -> tuple:
         """Among look-alike glyphs, try the more common character first."""
@@ -451,20 +456,147 @@ def _visual_order(glyphs: list) -> list:
 
 
 SPLIT_GAP_EM = 3.0  # a horizontal jump bigger than this starts a new line segment
+RULE_MAX = 3.0      # a filled rectangle thinner than this (pt) is a ruling line
+
+
+@dataclass
+class Rules:
+    """Ruling lines on a page (table borders, underlines, separators)."""
+    h: list[tuple[float, float, float]]   # horizontal: (x0, x1, y)
+    v: list[tuple[float, float, float]]   # vertical: (y0, y1, x)
+
+    def vertical_between(self, x0: float, x1: float, y: float) -> bool:
+        """A vertical rule crossing height y somewhere between x0 and x1."""
+        return any(x0 - 0.5 <= x <= x1 + 0.5 and a - 1 <= y <= b + 1 for a, b, x in self.v)
+
+    def horizontal_between(self, y0: float, y1: float, x0: float, x1: float) -> bool:
+        """A horizontal rule between heights y0 and y1, overlapping x0..x1."""
+        return any(y0 < y < y1 and a < x1 and b > x0 for a, b, y in self.h)
+
+
+_OWN_STREAM = re.compile(rb"^\s*q /KL\d+ Do Q\s*$")  # a line this app wrote (engine._write_line)
+
+
+def page_rules(page: pymupdf.Page) -> Rules:
+    """Table borders and other ruling lines: stroked straight lines, thin
+    filled rectangles, and the edges of stroked rectangles. (Glyph outlines,
+    including the ones this app draws, are filled curves and don't count.)
+    Cached per page: they only change when the PDF's own content does, not
+    when this app adds or edits text."""
+    doc = page.parent
+    cache = getattr(doc, "_khmerpdf_rules", None)
+    if cache is None:
+        cache = {}
+        try:
+            doc._khmerpdf_rules = cache
+        except AttributeError:
+            pass
+    key = tuple(x for x in page.get_contents() if not _OWN_STREAM.match(doc.xref_stream(x) or b""))
+    hit = cache.get(page.xref)
+    if hit and hit[0] == key:
+        return hit[1]
+    rules = _find_rules(page)
+    cache[page.xref] = (key, rules)
+    return rules
+
+
+def _find_rules(page: pymupdf.Page) -> Rules:
+    h: list = []
+    v: list = []
+
+    def edge(x0, y0, x1, y1):
+        if abs(y1 - y0) < 0.5 and abs(x1 - x0) > 2:
+            h.append((min(x0, x1), max(x0, x1), (y0 + y1) / 2))
+        elif abs(x1 - x0) < 0.5 and abs(y1 - y0) > 2:
+            v.append((min(y0, y1), max(y0, y1), (x0 + x1) / 2))
+
+    try:
+        paths = page.get_cdrawings()  # the fast variant: plain tuples
+    except Exception:
+        return Rules(h, v)
+    for path in paths:
+        stroked = "s" in (path.get("type") or "")
+        for it in path["items"]:
+            if it[0] == "l" and stroked:
+                edge(it[1][0], it[1][1], it[2][0], it[2][1])
+            elif it[0] in ("re", "qu"):
+                r = pymupdf.Rect(it[1]) if it[0] == "re" else pymupdf.Quad(it[1]).rect
+                if r.height <= RULE_MAX < r.width:
+                    edge(r.x0, (r.y0 + r.y1) / 2, r.x1, (r.y0 + r.y1) / 2)
+                elif r.width <= RULE_MAX < r.height:
+                    edge((r.x0 + r.x1) / 2, r.y0, (r.x0 + r.x1) / 2, r.y1)
+                elif stroked:
+                    edge(r.x0, r.y0, r.x1, r.y0)
+                    edge(r.x0, r.y1, r.x1, r.y1)
+                    edge(r.x0, r.y0, r.x0, r.y1)
+                    edge(r.x1, r.y0, r.x1, r.y1)
+    return Rules(h, v)
+
+
+COLUMN_GAP_EM = 1.0  # gaps at least this wide may be a table's column gutter
+COLUMN_ROWS = 3      # ...when this many nearby lines have one in the same place
+
+
+def _gaps(seg: dict) -> list[tuple[float, float]]:
+    """Wide horizontal gaps inside a line segment, left to right."""
+    gl = sorted(seg["glyphs"], key=lambda g: g[2][0])
+    out, right = [], gl[0][2][2]
+    for g in gl[1:]:
+        if g[2][0] - right > COLUMN_GAP_EM * g[5]:
+            out.append((right, g[2][0]))
+        right = max(right, g[2][2])
+    return out
+
+
+def _split_columns(segments: list[dict]) -> list[dict]:
+    """Split segments at the column gutters of a table without borders: wide
+    gaps in the same place on several nearby lines, with the text after them
+    starting (or the text before them ending) at the same x. The wide spaces
+    of justified text never line up like that."""
+    gaps = [_gaps(s) for s in segments]
+    if sum(map(len, gaps)) < COLUMN_ROWS:
+        return segments
+    out = []
+    for i, s in enumerate(segments):
+        size = max(g[5] for g in s["glyphs"])
+        cuts = []
+        for a, b in gaps[i]:
+            starts, ends = [b], [a]
+            for j, t in enumerate(segments):
+                if j != i and abs(t["baseline"] - s["baseline"]) <= 8 * size:
+                    for c, d in gaps[j]:
+                        if c < b and d > a:
+                            starts.append(d)
+                            ends.append(c)
+            if len(starts) >= COLUMN_ROWS and (max(starts) - min(starts) <= 2 or max(ends) - min(ends) <= 2):
+                cuts.append((a + b) / 2)
+        if not cuts:
+            out.append(s)
+            continue
+        edges = [-1e9] + sorted(cuts) + [1e9]
+        for lo, hi in zip(edges, edges[1:]):
+            gl = [g for g in s["glyphs"] if lo <= (g[2][0] + g[2][2]) / 2 < hi]  # keeps the drawing order
+            if gl:
+                out.append({"baseline": s["baseline"], "glyphs": gl,
+                            "x0": min(g[2][0] for g in gl), "x1": max(g[2][2] for g in gl)})
+    return out
 
 
 def _is_mark(ucs: int, bbox, size: float) -> bool:
     return 0x17B6 <= ucs <= 0x17D3 or ucs == 0x17DD or (bbox[2] - bbox[0]) < 0.05 * size
 
 
-def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = ()) -> list[FoundLine]:
+def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = (),
+               rules: Rules | None = None) -> list[FoundLine]:
     """Group the page's glyphs into visual lines and recover their text.
 
     MuPDF's own line splitting can separate a Khmer consonant from its vowel
     mark in justified text (marks are drawn with their own offsets), so we
     group by baseline ourselves, keep the PDF's drawing order (= visual glyph
-    order, which the decoder needs), and split only at large gaps.
+    order, which the decoder needs), and split only at large gaps - or where
+    a vertical rule (a table border) runs between two glyphs.
     """
+    rules = rules if rules is not None else page_rules(page)
     decs = page_decoders(page)
     glyphs = []  # (x, y, bbox, gid, text, size, font, color, decoder)
     for sp in page.get_texttrace():
@@ -501,6 +633,10 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = ()) -> list[Fou
         if abs(baselines[bi] - y) > 1.2 * size:
             continue
         seg = open_seg.get(bi)
+        if seg is not None and rules.v and (
+                rules.vertical_between(seg["x1"], bbox[0], baselines[bi] - 0.3 * size)
+                or rules.vertical_between(bbox[2], seg["x0"], baselines[bi] - 0.3 * size)):
+            seg = None  # the next table cell
         if seg is None or not (seg["x0"] - SPLIT_GAP_EM * size <= x <= seg["x1"] + SPLIT_GAP_EM * size):
             seg = {"baseline": baselines[bi], "x0": x, "x1": x, "glyphs": []}
             segments.append(seg)
@@ -508,6 +644,8 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = ()) -> list[Fou
         seg["glyphs"].append(g)
         seg["x0"] = min(seg["x0"], bbox[0])
         seg["x1"] = max(seg["x1"], bbox[2])
+
+    segments = _split_columns(segments)
 
     # 3. decode each segment
     out: list[FoundLine] = []
@@ -527,8 +665,10 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = ()) -> list[Fou
             # Word draws glyphs in visual order; other tools draw them in logical
             # order with explicit positions. Try the drawing order and the
             # left-to-right order; keep whichever matches more known syllables.
+            # On a tie, left-to-right wins: it is the order the reference
+            # dictionary is built in (drawn ហ េ ង also decodes, wrongly, as ហ + ងេ).
             candidates = []
-            for order in (gl, _visual_order(gl)):
+            for order in (_visual_order(gl), gl):
                 candidates.append(_decode_tokens([(g[3] if g[8] else -1, g[4], g[8]) for g in order]))
             text = min(candidates, key=lambda c: c[1])[0]
         approx = False

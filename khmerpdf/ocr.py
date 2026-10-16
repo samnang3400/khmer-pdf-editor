@@ -137,12 +137,34 @@ def run(png: bytes, dpi: int = OCR_DPI, origin=(0, 0)) -> list[OcrLine]:
     return parse_hocr(res.stdout.decode("utf-8", "replace"), 72 / dpi, tuple(origin))
 
 
+SCAN_COVER = 0.8  # an image covering this much of the page is a scan; smaller ones are pictures
+
+
+def page_images(page: pymupdf.Page) -> tuple[list[pymupdf.Rect], list[pymupdf.Rect]]:
+    """(scans, pictures): where the page's images are. OCR reads scans and
+    leaves pictures alone - text in a photo or logo is part of the picture."""
+    area = abs(page.rect)
+    scans, pictures = [], []
+    for img in page.get_image_info():
+        r = pymupdf.Rect(img["bbox"]) & page.rect
+        if r.is_empty:
+            continue
+        (scans if abs(r) >= SCAN_COVER * area else pictures).append(r)
+    return scans, pictures
+
+
 def is_scanned(page: pymupdf.Page) -> bool:
-    """No real text, but an image covering most of the page."""
+    """No real text, but an image covering (nearly) the whole page."""
     if page.get_text("text").strip():
         return False
-    area = abs(page.rect)
-    for img in page.get_image_info():
-        if abs(pymupdf.Rect(img["bbox"]) & page.rect) > 0.5 * area:
-            return True
-    return False
+    return bool(page_images(page)[0])
+
+
+def looks_like_text(text: str) -> bool:
+    """OCR of a photo or a drawing gives strings of symbols; real text is
+    mostly letters and digits."""
+    chars = [c for c in text if not c.isspace()]
+    if len(chars) < 2:
+        return False
+    good = sum(1 for c in chars if c.isalnum() or "\u1780" <= c <= "\u17ff")
+    return good >= 0.6 * len(chars)
