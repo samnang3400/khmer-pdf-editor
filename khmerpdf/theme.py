@@ -157,6 +157,8 @@ _ICONS = {
     "sidebar": '<rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="M9 4.5v15"/>',
     "document": '<path d="M14 3.5H7.5A2 2 0 0 0 5.5 5.5v13a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V8z"/>'
                 '<path d="M14 3.5V8h4.5"/><path d="M9 13h6"/><path d="M9 16.5h4"/>',
+    "image": '<rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><circle cx="9" cy="10" r="1.7"/>'
+             '<path d="m20.5 15.5-4.5-4.5-8.5 8.5"/>',
     "close": '<path d="M6 6l12 12"/><path d="M18 6 6 18"/>',
     "check": '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
 }

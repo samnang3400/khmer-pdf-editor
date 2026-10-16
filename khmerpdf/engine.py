@@ -629,17 +629,24 @@ def delete_line(page: pymupdf.Page, line: TextLine) -> None:
 
 def replace_text(page: pymupdf.Page, line: TextLine, new_text: str,
                  font: KhmerFont | None = None, size: float | None = None,
-                 color: tuple[float, float, float] | None = None, fit: bool = True) -> pymupdf.Rect:
-    """Remove a line of text and write `new_text` on the same baseline.
-    `fit=False` when the user changed the font or size on purpose."""
+                 color: tuple[float, float, float] | None = None, fit: bool = True,
+                 dx: float = 0.0, dy: float = 0.0) -> pymupdf.Rect:
+    """Remove a line of text and write `new_text` on the same baseline (or
+    moved by dx, dy). `fit=False` when the user changed the font or size on
+    purpose."""
     delete_line(page, line)
+    return _draw_line(page, line, new_text, font, size, color, fit, dx, dy)
+
+
+def _draw_line(page: pymupdf.Page, line: TextLine, new_text: str, font: KhmerFont | None, size: float | None,
+               color: tuple[float, float, float] | None, fit: bool, dx: float, dy: float) -> pymupdf.Rect:
     if not new_text.strip():
         return pymupdf.Rect(line.rect)
-    target = pymupdf.Rect(line.rect.x0, line.rect.y0, page.rect.x1 - 18, line.rect.y1)
+    target = pymupdf.Rect(line.rect.x0 + dx, line.rect.y0 + dy, page.rect.x1 - 18, line.rect.y1 + dy)
     # Keep the paragraph's shape: an edited line ends where the original did
     # (justified text), unless the new text is much longer or shorter.
     return insert_khmer_text(page, target, new_text, font=font, size=size or line.size,
-                             color=color or line.color, wrap_text=False, baseline=line.baseline,
+                             color=color or line.color, wrap_text=False, baseline=line.baseline + dy,
                              fit_width=line.rect.width if fit else None)
 
 
@@ -702,7 +709,27 @@ def _joiner(a: TextLine, b: TextLine) -> str:
     return ZERO_WIDTH[0]  # invisible word break: the text wraps there again
 
 
-def _continues(p: list[TextLine], ln: TextLine, rules=None, cells: set[int] = frozenset()) -> float | None:
+def _usual_steps(lines: list[TextLine]) -> dict[tuple[str, float], float]:
+    """The page's usual line spacing per font and size: the smaller common
+    distance between a line and the one below it. A clearly bigger distance
+    is space between paragraphs."""
+    by_style: dict[tuple[str, float], list[float]] = {}
+    ordered = sorted(lines, key=lambda ln: ln.baseline)
+    for i, a in enumerate(ordered):
+        key = (norm_font_name(a.font), round(a.size * 2) / 2)
+        for b in ordered[i + 1:]:
+            step = b.baseline - a.baseline
+            if step > 2.6 * a.size:
+                break
+            if (step >= 0.9 * a.size and b.rect.x0 < a.rect.x1 and b.rect.x1 > a.rect.x0
+                    and (norm_font_name(b.font), round(b.size * 2) / 2) == key):
+                by_style.setdefault(key, []).append(step)
+                break
+    return {k: sorted(v)[len(v) // 4] for k, v in by_style.items()}
+
+
+def _continues(p: list[TextLine], ln: TextLine, rules=None, cells: set[int] = frozenset(),
+               usual: dict | None = None) -> float | None:
     """Baseline step if `ln` is the next line of the paragraph `p`, else None.
     Conservative: same style, regular spacing, aligned left edges, and the
     previous line ran (nearly) to the paragraph's right edge. Never across a
@@ -722,6 +749,9 @@ def _continues(p: list[TextLine], ln: TextLine, rules=None, cells: set[int] = fr
         return None
     step = ln.baseline - last.baseline
     if not 0.9 * s <= step <= 2.6 * s:
+        return None
+    typical = (usual or {}).get((norm_font_name(last.font), round(s * 2) / 2))
+    if typical and step > 1.25 * typical:                 # space between paragraphs
         return None
     if len(p) > 1 and abs(step - (last.baseline - p[-2].baseline)) > 0.15 * step:
         return None
@@ -763,6 +793,7 @@ def paragraphs(lines: list[TextLine], page: pymupdf.Page | None = None, rules=No
         from .recover import page_rules
         rules = page_rules(page)
     cells = _table_cells(lines)
+    usual = _usual_steps([ln for ln in lines if not ln.block])
     out: list[Paragraph] = []
     rest: list[TextLine] = []
     blocks: dict[str, list[TextLine]] = {}
@@ -780,7 +811,7 @@ def paragraphs(lines: list[TextLine], page: pymupdf.Page | None = None, rules=No
     for ln in sorted(rest, key=lambda ln: (ln.baseline, ln.rect.x0)):
         best = None
         for p in open_:
-            step = _continues(p, ln, rules, cells)
+            step = _continues(p, ln, rules, cells, usual)
             if step is not None and (best is None or step < best[0]):
                 best = (step, p)
         if best:
@@ -813,10 +844,18 @@ def write_paragraph(page: pymupdf.Page, para: Paragraph, text: str, font: KhmerF
     moved by (dx, dy), re-wrapped to a new `width`, or scaled (font size, width
     and spacing) by `scale`. A one-line paragraph that isn't resized stays one
     line and keeps its width, like replace_text."""
+    delete_paragraph(page, para)
+    return draw_paragraph(page, para, text, font, size, color, dx, dy, width, scale)
+
+
+def draw_paragraph(page: pymupdf.Page, para: Paragraph, text: str, font: KhmerFont | None = None,
+                   size: float | None = None, color: tuple[float, float, float] | None = None,
+                   dx: float = 0.0, dy: float = 0.0, width: float | None = None,
+                   scale: float = 1.0) -> pymupdf.Rect:
+    """write_paragraph without removing the old text first (it already was)."""
     first = para.first
     size = (size or first.size) * scale
     font = font or default_font()
-    delete_paragraph(page, para)
     if not text.strip():
         return pymupdf.Rect(para.rect)
     x, baseline = para.x + dx, first.baseline + dy
@@ -889,3 +928,246 @@ def convert_legacy(page: pymupdf.Page, font: KhmerFont | None = None) -> int:
     for ln in lines:
         replace_text(page, ln, ln.text, font=font)
     return len(lines)
+
+
+# --------------------------------------------------------------------------
+# Pictures: move, resize, replace and delete
+# --------------------------------------------------------------------------
+@dataclass
+class Picture:
+    xref: int            # the image object
+    rect: pymupdf.Rect
+    name: str            # its resource name where it is drawn
+    owner: int           # 0 = drawn by the page itself, else by this Form XObject
+    nth: int             # which placement of the image on the page
+    behind_text: bool = False  # text is drawn over it (e.g. a background)
+
+
+def pictures(page: pymupdf.Page, lines: list[TextLine] | None = None) -> list[Picture]:
+    """The page's pictures (photos, logos...). A scan covering the page is the
+    page itself, not a picture."""
+    from .ocr import SCAN_COVER
+    area = abs(page.rect)
+    names: dict[int, tuple[str, int]] = {}
+    for im in page.get_images(full=True):
+        names.setdefault(im[0], (im[7], im[9]))
+    lines = text_lines(page) if lines is None else lines
+    seen: dict[int, int] = {}
+    out = []
+    digests = _image_digests(page.parent, names)
+    page._image_info = None  # PyMuPDF caches this per page object, also across our edits
+    for info in page.get_image_info(hashes=True):
+        xref = digests.get(info.get("digest"), 0)
+        if not xref:
+            continue  # inline image: nothing to point at
+        k = seen[xref] = seen.get(xref, -1) + 1
+        r = pymupdf.Rect(info["bbox"])
+        vis = r & page.rect
+        if vis.is_empty or abs(vis) >= SCAN_COVER * area:
+            continue
+        name, owner = names[xref]
+        out.append(Picture(xref, r, name, owner, k, any(_overlap(vis, ln.rect) > 0.5 for ln in lines)))
+    return out
+
+
+def _point(doc: pymupdf.Document, owner: int, name: str, xref: int) -> None:
+    """Make /Resources/XObject/<name> of `owner` (a page or form) point to
+    `xref` - in its own copy of the resource dictionaries, which PDF writers
+    often share between pages and forms."""
+    for key in ("Resources", "Resources/XObject"):
+        kind, val = doc.xref_get_key(owner, key)
+        if kind == "xref":
+            doc.xref_set_key(owner, key, doc.xref_object(int(val.split()[0]), compressed=True))
+    doc.xref_set_key(owner, f"Resources/XObject/{name}", f"{xref} 0 R")
+
+
+def _image_digests(doc: pymupdf.Document, xrefs) -> dict[bytes, int]:
+    """Image fingerprint -> xref, to tell which image object each placement
+    shows. Decoding an image to fingerprint it is slow: once per document."""
+    cache = getattr(doc, "_khmerpdf_digests", None)
+    if cache is None:
+        cache = {}
+        try:
+            doc._khmerpdf_digests = cache
+        except AttributeError:
+            pass
+    for x in xrefs:
+        if x not in cache:
+            try:
+                cache[x] = pymupdf.Pixmap(doc, x).digest
+            except Exception:
+                cache[x] = None
+    return {cache[x]: x for x in xrefs if cache[x]}
+
+
+def _own_form(page: pymupdf.Page, form: int) -> int | None:
+    """The Form XObject `form` drawn on this page (directly or inside other
+    forms), safe to change: when other pages draw it too (a header logo, say),
+    this page gets its own copy of it and of the forms around it."""
+    doc = page.parent
+    entries = [x for x in page.get_xobjects() if x[0] == form]
+    if len(entries) != 1:
+        return None  # not on this page, or drawn twice on it
+    _, name, invoker, _ = entries[0]
+    parent = page.xref if invoker == 0 else _own_form(page, invoker)
+    if parent is None:
+        return None
+    shared = sum(1 for pg in doc for x in pg.get_xobjects() if x[0] == form) > 1
+    if not shared and (invoker == 0 or parent == invoker):
+        return form
+    copy = doc.get_new_xref()
+    doc.update_object(copy, doc.xref_object(form, compressed=False))
+    doc.update_stream(copy, doc.xref_stream(form))
+    _point(doc, parent, name, copy)
+    return copy
+
+
+def remove_picture(page: pymupdf.Page, pic: Picture) -> bool:
+    """Take one placement of a picture off the page (the image itself stays
+    in the file for other placements). False if it can't be found.
+    Each place that draws the image is tried in turn, and kept only if the
+    picture at pic.rect is then gone - no guessing which one it was."""
+    doc = page.parent
+
+    def count() -> int:
+        page._image_info = None
+        return sum(1 for i in page.get_image_info()
+                   if all(abs(a - b) < 0.5 for a, b in zip(i["bbox"], pic.rect)))
+
+    before = count()
+    if not before:
+        return False
+    for xref, *_, name, _, owner in (im for im in page.get_images(full=True) if im[0] == pic.xref):
+        pat = re.compile(rb"/" + re.escape(name.encode()) + rb"\s+Do\b")
+        if owner:
+            owner = _own_form(page, owner)
+            if owner is None:
+                continue
+        for x in [owner] if owner else page.get_contents():
+            data = doc.xref_stream(x) or b""
+            for m in pat.finditer(data):
+                doc.update_stream(x, data[:m.start()] + data[m.end():])
+                if count() < before:
+                    return True
+                doc.update_stream(x, data)  # not this one
+    return False
+
+
+def move_picture(page: pymupdf.Page, pic: Picture, rect: pymupdf.Rect) -> bool:
+    """Move/resize a picture to `rect` (stretched to fill it)."""
+    if not remove_picture(page, pic):
+        return False
+    page.insert_image(rect, xref=pic.xref, keep_proportion=False, overlay=not pic.behind_text)
+    return True
+
+
+def replace_picture(page: pymupdf.Page, pic: Picture, data: bytes) -> bool:
+    """Put another image (file contents) in the picture's place, fitted inside
+    its box without distortion."""
+    if not remove_picture(page, pic):
+        return False
+    page.insert_image(pic.rect, stream=data, keep_proportion=True, overlay=not pic.behind_text)
+    return True
+
+
+def delete_picture(page: pymupdf.Page, pic: Picture) -> bool:
+    return remove_picture(page, pic)
+
+
+# --------------------------------------------------------------------------
+# Editing with room: when text grows, what is below it moves down
+# --------------------------------------------------------------------------
+def _below(page: pymupdf.Page, old: pymupdf.Rect, size: float,
+           edited: list[TextLine]) -> tuple[list, float | None]:
+    """What sits below `old` in its column: (paragraphs and pictures that can
+    move down, the top of the first thing that can't - a table, a ruling
+    line, unreadable text - or None). `edited`: the lines being replaced."""
+    from .recover import page_rules
+    rules = page_rules(page)
+    lines = text_lines(page, rules)
+    x0, x1 = old.x0, old.x1
+    top = old.y1 - 0.35 * size  # Khmer stacks overlap the next line a little
+
+    def column(r: pymupdf.Rect) -> bool:
+        return r.x0 < x1 - 1 and r.x1 > x0 + 1 and r.y0 >= top
+
+    limits = [y for a, b, y in rules.h if a < x1 - 1 and b > x0 + 1 and y >= top]
+    limits += [a for a, b, x in rules.v if x0 - 1 <= x <= x1 + 1 and a >= top]
+    cells = _table_cells(lines)
+    movers: list = []
+    gone = {(round(ln.rect.x0, 1), round(ln.baseline, 1)) for ln in edited}
+    found = []
+    for p in paragraphs(lines, rules=rules):
+        rest = [ln for ln in p.lines if (round(ln.rect.x0, 1), round(ln.baseline, 1)) not in gone]
+        if len(rest) == len(p.lines):
+            found.append(p)
+        else:  # a line of this paragraph is being edited: the lines after it move on their own
+            found += [Paragraph([ln], ln.text, ln.rect.x0, ln.rect.width, 0.0, False) for ln in rest]
+    for p in found:
+        if not column(p.rect):
+            continue
+        if p.garbled or any(id(ln) in cells for ln in p.lines):
+            limits.append(p.rect.y0)
+        else:
+            movers.append(p)
+    movers += [pic for pic in pictures(page, lines) if column(pic.rect)]
+    limit = min(limits, default=None)
+    if limit is not None:
+        movers = [m for m in movers if m.rect.y0 < limit]
+    return movers, limit
+
+
+def font_for_pdf(pdf_font: str) -> KhmerFont:
+    """The bundled font that is the PDF's font, else the default font."""
+    name = match_font(bundled_fonts(), pdf_font)
+    return load_font(bundled_fonts()[name]) if name else default_font()
+
+
+def edit_text(page: pymupdf.Page, target, text: str, font: KhmerFont | None = None,
+              size: float | None = None, color: tuple[float, float, float] | None = None,
+              fit: bool = True, dx: float = 0.0, dy: float = 0.0,
+              font_for=None) -> tuple[pymupdf.Rect, str | None, int]:
+    """Replace a line (TextLine) or paragraph with `text`. If it grows - more
+    lines, a bigger size - the paragraphs and pictures below it in its column
+    move down to make room, like in a word processor (not when the text is
+    being moved somewhere else with dx/dy). `font_for(pdf_font_name)` gives
+    the font to redraw moved text in. Returns (rect, warning, things moved)."""
+    single = isinstance(target, TextLine)
+    para = Paragraph([target], target.text, target.rect.x0, target.rect.width, 0.0, False) if single else target
+    first = para.first
+    font = font or default_font()
+    size = size or first.size
+    step = para.step * size / first.size if para.step else font.line_height(size)
+    n = (len(text.split("\n")) if single
+         else sum(len(layout(part, font, size, para.width)) for part in text.split("\n")))
+    bottom = first.baseline + dy - font.ascent(size) + (n - 1) * step + font.line_height(size)
+    grow = bottom - para.rect.y1
+    movers, warning = [], None
+    if text.strip() and grow > 0.5 and not (dx or dy):
+        movers, limit = _below(page, para.rect, first.size, para.lines)
+        lowest = max((m.rect.y1 for m in movers), default=para.rect.y1) + grow
+        if limit is not None and lowest > limit + 1:
+            warning = ("There isn't room below for the longer text: it now overlaps a table or line below it. "
+                       "Make it shorter, or move what's below.")
+        elif lowest > page.rect.y1 - 18:
+            warning = "The text below was pushed past the bottom of the page."
+    # 1. take everything off the page, then 2. draw it again: removing foreign
+    #    text works by area, so it must not catch text drawn in the meantime
+    delete_line(page, target) if single else delete_paragraph(page, para)
+    moved = []
+    for m in movers:
+        if isinstance(m, Picture):
+            if remove_picture(page, m):
+                moved.append(m)
+        else:
+            delete_paragraph(page, m)
+            moved.append(m)
+    rect = (_draw_line(page, target, text, font, size, color, fit, dx, dy) if single
+            else draw_paragraph(page, para, text, font, size, color, dx, dy))
+    for m in moved:
+        r = pymupdf.Rect(m.rect.x0, m.rect.y0 + grow, m.rect.x1, m.rect.y1 + grow)
+        if isinstance(m, Picture):
+            page.insert_image(r, xref=m.xref, keep_proportion=False, overlay=not m.behind_text)
+        else:
+            draw_paragraph(page, m, m.text, font=(font_for or font_for_pdf)(m.first.font), dy=grow)
+    return rect, warning, len(moved)

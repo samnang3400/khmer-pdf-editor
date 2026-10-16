@@ -212,3 +212,82 @@ def test_clicking_a_table_cell_edits_just_that_cell(qapp, tmp_path):
     w._close_inline(save=False)
     w.dirty = False
     w.close()
+
+
+# ---- dragging the edit box, making room, pictures ----------------------------
+def _layout_win(qapp, tmp_path, html, pics=None):
+    from tests.test_layout import _doc
+    fn = tmp_path / "layout.pdf"
+    _doc(html, pics).save(fn)
+    w = A.MainWindow()
+    w.resize(1000, 900)
+    w.show()
+    w.open_file(str(fn))
+    return w
+
+
+def test_drag_the_edit_box_to_move_the_text(qapp, tmp_path):
+    w = _layout_win(qapp, tmp_path, "<p>សួស្តី ពិភពលោក</p>")
+    w.set_mode("edit")
+    c = w.canvas
+    line = c.lines[0]
+    QTest.mouseClick(c, Qt.LeftButton, pos=QPoint(int((line.rect.x0 + 5) * c.scale), int((line.baseline - 3) * c.scale)))
+    grip = w.inline["grip"]
+    assert grip.isVisible()
+    start = grip.rect().center()
+    QTest.mousePress(grip, Qt.LeftButton, pos=start)
+    QTest.mouseMove(grip, start + QPoint(40, 100))
+    QTest.mouseRelease(grip, Qt.LeftButton, pos=start + QPoint(40, 100))
+    QTest.keyClick(w.inline["editor"], Qt.Key_Return)
+    (moved,) = text_lines(w.doc[0])
+    assert moved.text == line.text
+    assert abs(moved.baseline - (line.baseline + 100 / c.scale)) < 1.5
+    assert abs(moved.rect.x0 - (line.rect.x0 + 40 / c.scale)) < 1.5
+    w.dirty = False
+    w.close()
+
+
+def test_new_lines_push_the_text_below_down(qapp, tmp_path):
+    from tests.test_paragraphs import TEXT
+    w = _layout_win(qapp, tmp_path, f"<p>{TEXT}</p><p>សួស្តី ពិភពលោក</p><p>សូមអរគុណ។</p>")
+    w.set_mode("edit")
+    c = w.canvas
+    *body, first, below = sorted(c.lines, key=lambda ln: ln.baseline)
+    QTest.mouseClick(c, Qt.LeftButton, pos=QPoint(int((first.rect.x0 + 5) * c.scale), int((first.baseline - 3) * c.scale)))
+    w.inline["editor"].setPlainText("សួស្តី\nពិភពលោក\nម្តងទៀត")
+    QTest.keyClick(w.inline["editor"], Qt.Key_Return)
+    lines = sorted(text_lines(w.doc[0]), key=lambda ln: ln.baseline)[len(body):]
+    assert [ln.text for ln in lines] == ["សួស្តី", "ពិភពលោក", "ម្តងទៀត", "សូមអរគុណ។"]
+    assert lines[3].rect.y0 > lines[2].rect.y1 - 4                      # no overlap
+    assert "Made room" in w.statusBar().currentMessage()
+    w.undo()
+    after = sorted(text_lines(w.doc[0]), key=lambda ln: ln.baseline)
+    assert [ln.text for ln in after[-2:]] == [first.text, below.text]
+    w.dirty = False
+    w.close()
+
+
+def test_select_move_replace_and_delete_a_picture(qapp, tmp_path, monkeypatch):
+    from tests.test_layout import _png
+    w = _layout_win(qapp, tmp_path, "<p>សួស្តី</p><img src='pic.png' width='120'/>", pics=_png())
+    w.set_mode("select")
+    c = w.canvas
+    (pic,) = c.pics
+    p0 = QPoint(int((pic.rect.x0 + 30) * c.scale), int((pic.rect.y0 + 30) * c.scale))
+    QTest.mousePress(c, Qt.LeftButton, pos=p0)
+    assert c.selected is pic and w.replace_img_act.isEnabled() and w.delete_act.isEnabled()
+    for d in (QPoint(10, 10), QPoint(100, 150)):
+        QTest.mouseMove(c, p0 + d)
+    QTest.mouseRelease(c, Qt.LeftButton, pos=p0 + QPoint(100, 150))
+    (moved,) = c.pics
+    assert c.selected is moved and abs(moved.rect.x0 - (pic.rect.x0 + 100 / c.scale)) < 1
+    new = tmp_path / "new.png"
+    new.write_bytes(_png((0.1, 0.3, 0.9)))
+    monkeypatch.setattr(A.QFileDialog, "getOpenFileName", lambda *a, **k: (str(new), ""))
+    w.replace_image()
+    (replaced,) = c.pics
+    assert replaced.xref != pic.xref
+    w.delete_selection()
+    assert not c.pics and len(w.undo_stack) == 3
+    w.dirty = False
+    w.close()

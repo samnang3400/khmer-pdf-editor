@@ -145,6 +145,7 @@ def page_images(page: pymupdf.Page) -> tuple[list[pymupdf.Rect], list[pymupdf.Re
     leaves pictures alone - text in a photo or logo is part of the picture."""
     area = abs(page.rect)
     scans, pictures = [], []
+    page._image_info = None  # PyMuPDF caches this per page object, also across edits
     for img in page.get_image_info():
         r = pymupdf.Rect(img["bbox"]) & page.rect
         if r.is_empty:

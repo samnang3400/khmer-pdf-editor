@@ -27,13 +27,18 @@ Lines written by the app also store their own text, font, size and colour, so ed
   recent files and a light/dark interface that follows the Windows setting
 - **Edit Text**: click any line or paragraph and edit it right on the page (Enter = save, Shift+Enter =
   new line, Esc = cancel, clicking elsewhere saves). Text from broken Khmer PDFs is recovered first.
-  An edited line keeps the original's width (justified paragraphs keep their right edge)
+  An edited line keeps the original's width (justified paragraphs keep their right edge). Drag the
+  editor's **Move** tab to put the text somewhere else. When the text grows (or you add lines), the
+  paragraphs and pictures **below it move down to make room**, like in a word processor; tables and
+  ruling lines stay put, and you're warned if there isn't room
 - **Paragraphs**: lines that flow on (same font and size, regular spacing, aligned edges) are edited
   as one paragraph and re-wrapped inside its width; justified paragraphs stay justified. Text added
   with the app keeps its exact paragraph
 - **Select** (V): click text to select it, drag it to **move** it, drag a side handle to change its
   **width** (the text re-wraps), a corner to make it **bigger or smaller**, and press Delete to
   **delete** it. Double-click to edit
+- **Pictures** (Select tool): move, resize (corners keep the shape, sides stretch), **Replace Image**
+  (or double-click) and delete. A picture shared with other pages (a header logo) only changes on this page
 - **Limon → Unicode**: text in the legacy Limon fonts (Limon S1, R1, F1…) is converted to Unicode Khmer
   when you edit it; **Convert Limon** rewrites all of it in a Unicode font, in place, so it can be
   searched and copied
@@ -102,7 +107,9 @@ and optionally adds KhmerPDF to *Open with* for PDFs without changing the defaul
   fonts (ABC, Baidok…); using OCR to check text rebuilt without its font
 - **Phase 3:** page operations (merge, split, rotate, reorder), form filling, signatures, annotations
 - Rotated pages are supported for adding text, but less tested than upright pages
-- A paragraph that grows when edited isn't moved out of the way of text below it
+- Text that moves to make room is redrawn; if its font isn't available it is drawn in the toolbar's font
+- Lines in tables and borderless tables are found from borders and aligned columns; unusual layouts
+  may still join or split wrongly
 - Paragraph detection is deliberately cautious: lines in tables or columns stay separate lines
 - Moving or resizing text from another PDF redraws it; if its font isn't available it is drawn in
   the toolbar's font. First-line indents are not kept when a paragraph re-wraps

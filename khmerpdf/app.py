@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pymupdf
-from PySide6.QtCore import QEvent, QEventLoop, QPointF, QRect, QRectF, QSettings, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QEventLoop, QPoint, QPointF, QRect, QRectF, QSettings, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontDatabase, QFontMetricsF,
                            QGuiApplication, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap)
 from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog,
@@ -20,9 +20,10 @@ from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDoubleSpi
 from . import __version__, ocr
 from .recover import page_rules
 from . import theme as T
-from .engine import (Paragraph, TextLine, add_ocr_layer, bundled_fonts, convert_legacy, delete_paragraph,
-                     insert_khmer_text, load_font, match_font, paragraphs, replace_text, search,
-                     system_khmer_fonts, text_lines, write_paragraph)
+from .engine import (Paragraph, Picture, TextLine, add_ocr_layer, bundled_fonts, convert_legacy,
+                     delete_paragraph, delete_picture, edit_text, insert_khmer_text, load_font, match_font,
+                     move_picture, paragraphs, pictures, replace_picture, search, system_khmer_fonts,
+                     text_lines, write_paragraph)
 
 APP_NAME = "KhmerPDF Editor"
 SCREEN_DPI = 96
@@ -37,8 +38,14 @@ def resource_path(*parts: str) -> Path:
     return base.joinpath(*parts)
 
 
-def block_rect(para: Paragraph) -> pymupdf.Rect:
-    """The paragraph's box: its wrap width, and the height of its lines."""
+IMAGE_FILES = "Images (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff)"
+
+
+def block_rect(para) -> pymupdf.Rect:
+    """The paragraph's box: its wrap width, and the height of its lines.
+    (A picture's box is just its rectangle.)"""
+    if isinstance(para, Picture):
+        return pymupdf.Rect(para.rect)
     r = para.rect
     return pymupdf.Rect(min(para.x, r.x0), r.y0, max(para.x + para.width, r.x1), r.y1)
 
@@ -124,6 +131,40 @@ class InlineEditor(QPlainTextEdit):
         self.resize(int(max(w, self.min_width)), int(h))
 
 
+class EditorGrip(QLabel):
+    """A tab on the in-place editor: drag it to move the text elsewhere."""
+
+    def __init__(self, parent: QWidget, editor: InlineEditor):
+        super().__init__("⠿  Move", parent)
+        self.editor = editor
+        self.setCursor(Qt.SizeAllCursor)
+        self.setToolTip("Drag to move the text")
+        self._last: QPoint | None = None
+
+    def place(self):
+        self.adjustSize()
+        y = self.editor.y() - self.height() + 2
+        if y < 0:  # no room above: hang it below the editor
+            y = self.editor.y() + self.editor.height() - 2
+        self.move(self.editor.x() + 6, y)
+        self.raise_()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._last = e.globalPosition().toPoint()
+
+    def mouseMoveEvent(self, e):
+        if self._last is not None:
+            p = e.globalPosition().toPoint()
+            self.editor.move(self.editor.pos() + (p - self._last))
+            self._last = p
+            self.place()
+
+    def mouseReleaseEvent(self, e):
+        self._last = None
+        self.editor.setFocus()
+
+
 # --------------------------------------------------------------------------
 # Page canvas
 # --------------------------------------------------------------------------
@@ -150,13 +191,15 @@ class PageCanvas(QWidget):
         self.mode = "view"
         self.lines: list[TextLine] = []
         self.paras: list[Paragraph] = []
-        self.hover: Paragraph | None = None
-        self.selected: Paragraph | None = None
+        self.pics: list[Picture] = []
+        self.hover: Paragraph | Picture | None = None
+        self.selected: Paragraph | Picture | None = None
         self.highlights: list[pymupdf.Rect] = []
         self._drag: dict | None = None
 
-    def set_page(self, pixmap: QPixmap, scale: float, lines: list[TextLine], paras: list[Paragraph]):
-        self.pixmap, self.scale, self.lines, self.paras = pixmap, scale, lines, paras
+    def set_page(self, pixmap: QPixmap, scale: float, lines: list[TextLine], paras: list[Paragraph],
+                 pics: list[Picture] = ()):
+        self.pixmap, self.scale, self.lines, self.paras, self.pics = pixmap, scale, lines, paras, list(pics)
         self.hover = None
         self.selected = None
         self._drag = None
@@ -179,9 +222,14 @@ class PageCanvas(QWidget):
                "l": QPointF(r.left(), r.center().y()), "r": QPointF(r.right(), r.center().y())}
         return {k: QRectF(p.x() - 4, p.y() - 4, 8, 8) for k, p in pts.items()}
 
-    def hit(self, pos) -> Paragraph | None:
+    def hit(self, pos) -> Paragraph | Picture | None:
+        """Text under the mouse - or, with the Select tool, a picture (the one
+        drawn last, i.e. on top)."""
         pt = self._to_page(pos)
-        return next((p for p in self.paras if pt in block_rect(p)), None)
+        para = next((p for p in self.paras if pt in block_rect(p)), None)
+        if para is None and self.mode == "select":
+            para = next((p for p in reversed(self.pics) if pt in p.rect), None)
+        return para
 
     def _handle_at(self, pos: QPointF) -> str | None:
         if not self.selected:
@@ -211,8 +259,12 @@ class PageCanvas(QWidget):
                 col = warn if para.needs_check else accent
                 p.setPen(QPen(tint(col, 150 if para.needs_check else 70), 1, Qt.DashLine))
                 p.drawRoundedRect(self._box(para), 3, 3)
+            if self.mode == "select":
+                p.setPen(QPen(tint(QColor(t.muted), 110), 1, Qt.DotLine))
+                for pic in self.pics:
+                    p.drawRect(self._box(pic))
             if self.hover and self.hover is not self.selected:
-                col = warn if self.hover.needs_check else accent
+                col = warn if getattr(self.hover, "needs_check", False) else accent
                 p.setPen(QPen(col, 1.5))
                 p.setBrush(tint(col, 28))
                 p.drawRoundedRect(self._box(self.hover), 3, 3)
@@ -509,8 +561,8 @@ class MainWindow(QMainWindow):
         self.canvas.para_clicked.connect(self.edit_paragraph)
         self.canvas.pressed.connect(lambda: self._close_inline(save=True))
         self.canvas.selection_changed.connect(self._selection_changed)
-        self.canvas.move_requested.connect(self.move_paragraph)
-        self.canvas.resize_requested.connect(self.resize_paragraph)
+        self.canvas.move_requested.connect(self.move_item)
+        self.canvas.resize_requested.connect(self.resize_item)
         self.canvas.edit_requested.connect(self._edit_from_select)
 
         self.scroll = QScrollArea(objectName="pages")
@@ -626,6 +678,10 @@ class MainWindow(QMainWindow):
         self.delete_act = self._act("Delete", self.delete_selection, "delete", QKeySequence.Delete,
                                     "Delete the selected text", tb)
         self.delete_act.setEnabled(False)
+        self.replace_img_act = self._act("Replace Image", self.replace_image, "image", None,
+                                         "Put another picture in place of the selected one", tb)
+        tb.widgetForAction(self.replace_img_act).setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.replace_img_act.setEnabled(False)
         tb.addSeparator()
 
         self.ocr_act = self._act("Recognize Text", self.ocr_page, "ocr", "Ctrl+Shift+R",
@@ -912,10 +968,11 @@ class MainWindow(QMainWindow):
         self.canvas.highlights = [r for n, r in self.search_hits if n == self.page_no]
         rules = page_rules(page)  # table borders keep cells apart
         lines = text_lines(page, rules)
-        self.canvas.set_page(qpix, scale, lines, paragraphs(lines, rules=rules))
+        self.canvas.set_page(qpix, scale, lines, paragraphs(lines, rules=rules), pictures(page, lines))
         if key and self.canvas.mode == "select":
-            self.canvas.selected = next((p for p in self.canvas.paras if abs(p.x - key[0]) < 2
-                                         and abs(p.first.baseline - key[1]) < 1.5), None)
+            self.canvas.selected = next((p for p in self.canvas.paras + self.canvas.pics
+                                         if self._key(p)[0] == key[0] and abs(self._key(p)[1] - key[1]) < 2
+                                         and abs(self._key(p)[2] - key[2]) < 1.5), None)
         self._selection_changed(self.canvas.selected)
         self.page_spin.blockSignals(True)
         self.page_spin.setValue(self.page_no + 1)
@@ -956,9 +1013,17 @@ class MainWindow(QMainWindow):
     def _rebuild_thumbs(self):
         self.thumbs.blockSignals(True)
         self.thumbs.clear()
+        blank: dict[tuple[int, int], QIcon] = {}
         for i in range(self.doc.page_count):
             it = QListWidgetItem(str(i + 1))
             it.setTextAlignment(Qt.AlignHCenter)
+            r = self.doc[i].rect
+            size = (THUMB_W, max(int(THUMB_W * r.height / r.width), 1))
+            if size not in blank:  # a white page until its picture is ready, so the list doesn't jump
+                pm = QPixmap(*size)
+                pm.fill(QColor("white"))
+                blank[size] = QIcon(pm)
+            it.setIcon(blank[size])
             it.setSizeHint(QSize(THUMB_W + 16, int(THUMB_W * 1.42) + 30))
             self.thumbs.addItem(it)
         self.thumbs.setCurrentRow(self.page_no)
@@ -1028,15 +1093,23 @@ class MainWindow(QMainWindow):
         self._refresh_undo_actions()
 
     @staticmethod
-    def _key(para: Paragraph) -> tuple[float, float]:
-        return para.x, para.first.baseline
+    def _key(item) -> tuple[str, float, float]:
+        """Finds the same paragraph or picture again after the page is redrawn."""
+        if isinstance(item, Picture):
+            return "pic", item.rect.x0, item.rect.y0
+        return "text", item.x, item.first.baseline
 
     def _font_for(self, pdf_font: str) -> str:
         return match_font(self.fonts.paths, pdf_font) or self.cur_font
 
     def _selection_changed(self, para):
         self.delete_act.setEnabled(para is not None and self.canvas.mode == "select")
-        if para is not None:
+        self.replace_img_act.setEnabled(isinstance(para, Picture) and self.canvas.mode == "select")
+        if isinstance(para, Picture):
+            r = para.rect
+            self.statusBar().showMessage(f"Picture selected · {r.width:.0f} × {r.height:.0f} pt · drag to move, "
+                                         "handles resize, double-click to replace")
+        elif para is not None:
             if para.garbled:
                 self.statusBar().showMessage("This text can't be read from the PDF, so it can't be moved. "
                                              "You can delete it, or edit it and type its text.")
@@ -1060,7 +1133,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, APP_NAME, f"Could not change the text:\n{exc}")
             return False
         first, scale = para.first, kw.get("scale", 1.0)
-        self._select_key = (para.x + kw.get("dx", 0.0), first.baseline + kw.get("dy", 0.0))
+        self._select_key = ("text", para.x + kw.get("dx", 0.0), first.baseline + kw.get("dy", 0.0))
         self._changed()
         if not match_font(self.fonts.paths, first.font) and not first.xref:
             self.statusBar().showMessage(f"The PDF's font “{first.font}” isn't available, so the text was "
@@ -1069,8 +1142,54 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Text size: {first.size * scale:.1f} pt")
         return True
 
-    def move_paragraph(self, para: Paragraph, dx: float, dy: float):
-        self._rewrite(para, para.text, dx=dx, dy=dy)
+    def _picture_op(self, op, pic: Picture, *args, rect: pymupdf.Rect | None = None, done: str = "") -> bool:
+        """Move/resize/replace/delete a picture as one undo step."""
+        self._snapshot()
+        try:
+            ok = op(self.doc[self.page_no], pic, *args)
+        except Exception as exc:
+            self._restore(self.undo_stack.pop())
+            QMessageBox.critical(self, APP_NAME, f"Could not change the picture:\n{exc}")
+            return False
+        if not ok:
+            self.undo_stack.pop()
+            QMessageBox.information(self, APP_NAME, "This picture is drawn in a way KhmerPDF can't change yet.")
+            return False
+        self._select_key = self._key(Picture(pic.xref, rect, "", 0, 0)) if rect is not None else None
+        self._changed()
+        if done:
+            self.statusBar().showMessage(done, 4000)
+        return True
+
+    def move_item(self, item, dx: float, dy: float):
+        if isinstance(item, Picture):
+            r = item.rect
+            new = pymupdf.Rect(r.x0 + dx, r.y0 + dy, r.x1 + dx, r.y1 + dy)
+            self._picture_op(move_picture, item, new, rect=new)
+        else:
+            self._rewrite(item, item.text, dx=dx, dy=dy)
+
+    def resize_item(self, item, r: pymupdf.Rect, corner: bool):
+        if isinstance(item, Picture):
+            self._picture_op(move_picture, item, r, rect=r, done=f"Picture: {r.width:.0f} × {r.height:.0f} pt")
+        else:
+            self.resize_paragraph(item, r, corner)
+
+    def replace_image(self, pic: Picture | None = None):
+        pic = pic if isinstance(pic, Picture) else self.canvas.selected
+        if not isinstance(pic, Picture):
+            return
+        start = str(Path(self.path).parent) if self.path else ""
+        path, _ = QFileDialog.getOpenFileName(self, "Replace picture", start, IMAGE_FILES)
+        if not path:
+            return
+        try:
+            data = Path(path).read_bytes()
+            pymupdf.open(stream=data, filetype=Path(path).suffix[1:].lower())  # can it be read at all?
+        except Exception as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not read the picture:\n{exc}")
+            return
+        self._picture_op(replace_picture, pic, data, rect=pic.rect, done="Picture replaced (Ctrl+Z to undo)")
 
     def resize_paragraph(self, para: Paragraph, r: pymupdf.Rect, corner: bool):
         old = block_rect(para)
@@ -1086,6 +1205,10 @@ class MainWindow(QMainWindow):
         para = self.canvas.selected
         if not para or self.canvas.mode != "select":
             return
+        if isinstance(para, Picture):
+            self.canvas.selected = None
+            self._picture_op(delete_picture, para, done="Picture deleted (Ctrl+Z to undo)")
+            return
         self._snapshot()
         try:
             delete_paragraph(self.doc[self.page_no], para)
@@ -1097,7 +1220,10 @@ class MainWindow(QMainWindow):
         self._changed()
         self.statusBar().showMessage("Text deleted (Ctrl+Z to undo)", 4000)
 
-    def _edit_from_select(self, para: Paragraph):
+    def _edit_from_select(self, para):
+        if isinstance(para, Picture):
+            self.replace_image(para)
+            return
         self.set_mode("edit")
         para = next((p for p in self.canvas.paras if self._key(p) == self._key(para)), para)
         self.edit_paragraph(para)
@@ -1173,14 +1299,18 @@ class MainWindow(QMainWindow):
         ed.setPlainText(text)
         ed.commit.connect(lambda: self._close_inline(save=True))
         ed.cancel.connect(lambda: self._close_inline(save=False))
-        self.inline = dict(editor=ed, kind=kind, line=target if kind == "edit" else None,
+        grip = EditorGrip(self.canvas, ed)
+        self.inline = dict(editor=ed, grip=grip, kind=kind, line=target if kind == "edit" else None,
                            para=target if kind == "para" else None, rect=pymupdf.Rect(rect),
                            start=(text, font, size, QColor(color).name()))
         self._style_inline()
         top = (target.baseline - size * 1.0) * s if kind == "edit" else rect.y0 * s
         ed.move(int(rect.x0 * s) - 5, int(min(top, rect.y0 * s)) - 5)
+        self.inline["origin"] = QPoint(ed.pos())
         ed.show()
         ed.fit()  # again, now that it is laid out on screen
+        grip.show()
+        grip.place()
         ed.setFocus()
         ed.moveCursor(ed.textCursor().MoveOperation.End)
         self.insert_zwsp_act.setEnabled(True)
@@ -1197,6 +1327,10 @@ class MainWindow(QMainWindow):
                          f"border: 2px solid {border}; border-radius: 4px; selection-background-color: "
                          f"{self.theme.accent}; selection-color: white; }}")
         ed.fit()
+        grip = self.inline["grip"]
+        grip.setStyleSheet(f"QLabel {{ background: {border}; color: white; font-size: 11px; font-weight: 600; "
+                           f"padding: 2px 8px; border-radius: 4px; }}")
+        grip.place()
 
     def _close_inline(self, save: bool) -> None:
         """Save (or discard) the open in-place editor, if any."""
@@ -1205,13 +1339,16 @@ class MainWindow(QMainWindow):
         st, self.inline = self.inline, None
         ed = st["editor"]
         text = ed.toPlainText()
-        ed.hide()
-        ed.deleteLater()
+        moved = ed.pos() - st.get("origin", ed.pos())
+        dx, dy = moved.x() / self.canvas.scale, moved.y() / self.canvas.scale  # dragged by its grip
+        for w in (ed, st["grip"]):
+            w.hide()
+            w.deleteLater()
         self.insert_zwsp_act.setEnabled(False)
         self.canvas.setFocus()
         if not save or not self.doc:
             return
-        unchanged = (text, self.cur_font, self.cur_size, self.cur_color.name()) == st["start"]
+        unchanged = (text, self.cur_font, self.cur_size, self.cur_color.name()) == st["start"] and not (dx or dy)
         if st["kind"] == "add" and not text.strip():
             return
         if st["kind"] == "edit" and (unchanged or (st["line"].garbled and not text.strip())):
@@ -1220,23 +1357,31 @@ class MainWindow(QMainWindow):
             return
         c = self.cur_color
         rgb = (c.redF(), c.greenF(), c.blueF())
-        if st["kind"] == "para":
-            self._rewrite(st["para"], text, font=self.cur_font, size=self.cur_size, color=rgb)
-            return
         font = load_font(self.fonts.paths[self.cur_font])
         self._snapshot()
+        warning, made_room = None, 0
         try:
             page = self.doc[self.page_no]
             if st["kind"] == "add":
-                insert_khmer_text(page, st["rect"], text, font=font, size=self.cur_size, color=rgb)
+                r = st["rect"]
+                insert_khmer_text(page, pymupdf.Rect(r.x0 + dx, r.y0 + dy, r.x1 + dx, r.y1 + dy), text,
+                                  font=font, size=self.cur_size, color=rgb)
             else:
-                replace_text(page, st["line"], text, font=font, size=self.cur_size, color=rgb,
-                             fit=st["start"][1:3] == (self.cur_font, self.cur_size))
+                # longer text pushes what's below it down (unless it was dragged elsewhere)
+                _, warning, made_room = edit_text(
+                    page, st["line"] if st["kind"] == "edit" else st["para"], text, font=font,
+                    size=self.cur_size, color=rgb, fit=st["start"][1:3] == (self.cur_font, self.cur_size),
+                    dx=dx, dy=dy, font_for=lambda name: load_font(self.fonts.paths[self._font_for(name)]))
         except Exception as exc:
             self._restore(self.undo_stack.pop())
             QMessageBox.critical(self, APP_NAME, f"Could not save the text:\n{exc}")
             return
         self._changed()
+        if warning:
+            self.statusBar().showMessage("⚠ " + warning, 12000)
+        elif made_room:
+            self.statusBar().showMessage(f"Made room: moved {made_room} paragraph{'s' if made_room != 1 else ''} "
+                                         "or picture(s) below it down. Ctrl+Z undoes it all.", 8000)
 
     def insert_zwsp(self):
         if self.inline:
