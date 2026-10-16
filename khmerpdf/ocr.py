@@ -138,7 +138,7 @@ def run(png: bytes, dpi: int = OCR_DPI, origin=(0, 0)) -> list[OcrLine]:
     return clean(parse_hocr(res.stdout.decode("utf-8", "replace"), 72 / dpi, tuple(origin)))
 
 
-JUNK_CONFIDENCE = 15  # below this a line is noise (a border, an ornament, a speck)
+JUNK_CONFIDENCE = 15  # below this a short line is noise (a border, an ornament, a speck)
 
 
 def clean(lines: list[OcrLine]) -> list[OcrLine]:
@@ -151,11 +151,11 @@ def clean(lines: list[OcrLine]) -> list[OcrLine]:
     out = []
     for ln in lines:
         visible = [c for c in ln.text if not c.isspace()]
-        if ln.confidence < JUNK_CONFIDENCE:
-            continue
+        letters = sum(1 for c in visible if "\u1780" <= c <= "\u17b3" or c.isalpha() and c.isascii())
+        if ln.confidence < JUNK_CONFIDENCE and letters < 6:
+            continue  # (a real line read badly stays: it's marked "please check")
         if khmer_page and not khmer(ln.text) and len(visible) <= 3 and not any(c.isdigit() for c in visible):
             continue  # "A", "r=" on a Khmer page: an ornament read as letters
-        letters = sum(1 for c in visible if "\u1780" <= c <= "\u17b3" or c.isalpha() and c.isascii())
         if letters < 2 and ln.confidence < 60 and not all(c.isdigit() or c in ".-()" for c in visible):
             continue  # "ជ", ">ៗ2=0": a speck or a border, not a page number
         out.append(dataclass_replace(ln, text=correct(ln.text)))

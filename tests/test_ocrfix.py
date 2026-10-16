@@ -39,5 +39,6 @@ def _line(text, conf):
 
 def test_noise_lines_are_dropped():
     lines = [_line("អារម្ភកថា", 93), _line("EEE", 0), _line("A", 85), _line("ជ", 21),
-             _line(">ៗ2=0", 46), _line("១២", 40), _line("នេះ គឺជាសៀវភៅ", 80)]
-    assert [ln.text for ln in clean(lines)] == ["អារម្ភកថា", "១២", "នេះ គឺជាសៀវភៅ"]
+             _line(">ៗ2=0", 46), _line("១២", 40), _line("នេះ គឺជាសៀវភៅ", 80),
+             _line("សេចក្តីពន្យល់នៃក្រមនីតិវិធី", 9)]  # a real line read badly stays
+    assert [ln.text for ln in clean(lines)] == ["អារម្ភកថា", "១២", "នេះ គឺជាសៀវភៅ", "សេចក្តីពន្យល់នៃក្រមនីតិវិធី"]
