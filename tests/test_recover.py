@@ -242,3 +242,38 @@ def test_slightly_redrawn_font_version_still_decodes(tmp_path):
                         archive=pymupdf.Archive(str(tmp_path)))
     page = pymupdf.open(stream=doc.tobytes())[0]
     assert [ln.text for ln in text_lines(page)] == words
+
+
+@pytest.mark.parametrize("word", ["សង្ស័យ", "ឱ្យខ្ញុំ", "សួគ៌ាល័យ", "ព្រឹត្តិការណ៍", "ចំណុច"])
+def test_syllables_that_need_more_than_consonant_vowel_sign(word):
+    # a subscript with ័/៍, an independent vowel with ្យ, robat before the vowel
+    dec = decoder(str(KHMER_OS / "KhmerOSmetalchrieng.ttf"))
+    assert dec.decode([(g, "?") for g in dec._shape(word)]) == word
+
+
+def test_a_letter_mapped_to_space_is_still_a_letter():
+    # Word maps ណ to " " in the text layer; its outline says otherwise
+    import uharfbuzz as hb
+    from khmerpdf.recover import _inked
+    font = hb.Font(hb.Face((KHMER_OS / "KhmerOSmetalchrieng.ttf").read_bytes()))
+    dec = decoder(str(KHMER_OS / "KhmerOSmetalchrieng.ttf"))
+    assert _inked(font, dec._shape("ណ")[0]) and not _inked(font, dec._shape(" ")[0])
+
+
+def test_a_space_drawn_back_into_a_word_is_not_a_pre_base_vowel():
+    from khmerpdf.recover import _visual_order
+    gl = [_g(70.0, "ដ", 572, 9.4), _g(79.6, "រ", 588, 5.0), _g(74.0, " ", 1, 3.5)]
+    assert [g[4] for g in _visual_order(gl)] == ["ដ", "រ", " "]
+
+
+def test_a_justified_line_split_at_a_wide_gap_is_joined_again():
+    from khmerpdf.recover import Rules, _rejoin_justified
+
+    def seg(x0, x1, y):
+        return {"baseline": y, "x0": x0, "x1": x1, "glyphs": [_g(x0, "ក", 562, x1 - x0)]}
+    lines = [seg(72, 540, 100), seg(72, 130, 113), seg(170, 500, 113), seg(72, 540, 126)]
+    out = _rejoin_justified(lines, Rules(h=[], v=[]))
+    assert [(s["x0"], s["x1"]) for s in out] == [(72, 540), (72, 500), (72, 540)]
+    # table cells: no line spans the gap, so they stay apart
+    cells = [seg(72, 130, 100), seg(170, 300, 100), seg(72, 130, 113), seg(170, 300, 113)]
+    assert len(_rejoin_justified(cells, Rules(h=[], v=[]))) == 4

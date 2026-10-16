@@ -35,6 +35,7 @@ SHIFTERS = ["៉", "៊"]           # MUUSIKATOAN, TRIISAP
 COMMON_FINAL = ["ំ", "ះ", "់"]  # NIKAHIT, REAHMUK, BANTOC
 SUBS = ["្" + c for c in CONS]
 SECOND_SUBS = ["្រ", "្វ", "្យ"]  # ្រ ្វ ្យ
+SUB_SIGNS = ["័", "៍", "៌", "៏"]  # signs that also sit on a subscript (សង្ស័យ, ការណ៍ ...)
 OTHER = ([chr(c) for c in range(0x17D4, 0x17DB)] + [chr(c) for c in range(0x17E0, 0x17EA)]
          + [" ", "​"])
 KHMER_MARK = re.compile(r"[ា-៓៝]")
@@ -49,7 +50,7 @@ def _norm(name: str) -> str:
 # --------------------------------------------------------------------------
 # Reverse dictionary per reference font
 # --------------------------------------------------------------------------
-CACHE_VERSION = 1  # bump when _build changes in a way the tables below don't show
+CACHE_VERSION = 3  # bump when _build changes in a way the tables below don't show
 
 
 def _cache_dir() -> Path:
@@ -173,13 +174,19 @@ class GlyphDecoder:
                     for v in ("", "ា", "ុ", "ោ", "េ"):
                         for f in COMMON_FINAL:
                             add(c + s1 + v + f)
+                    for sg in SUB_SIGNS:
+                        add(c + s1 + sg)
             for v in VOWELS:
                 for s in SIGNS:
                     add(c + v + s)
+                add(c + "៌" + v)  # robat comes before the vowel: សួគ៌ា
         for c in INDEP + OTHER:
             add(c)
             for s in SIGNS:
                 add(c + s)
+        for c in INDEP:
+            for s1 in SECOND_SUBS:  # ឱ្យ
+                add(c + s1)
         # Fallback for glyphs met outside a known syllable: what a single glyph
         # stands for when it follows a base consonant.
         for g, t in self.seq.items():
@@ -609,7 +616,7 @@ def _visual_order(glyphs: list) -> list:
                 home.insert(at, g)
             else:
                 home.append(g)
-        elif (clusters and not _blank(clusters[-1][0])
+        elif (clusters and not _blank(clusters[-1][0]) and not _blank(g)
               and clusters[-1][0][0] - 1.5 * g[5] < g[0] < clusters[-1][0][0] - 0.01):
             clusters[-1].insert(0, g)  # drawn just left of the syllable: pre-base (េ, ្រ)
         elif clusters and mark and not _blank(clusters[-1][0]):
@@ -627,6 +634,11 @@ def _visual_order(glyphs: list) -> list:
         else:
             placed.append(c)
     return [g for c in placed for g in c]
+
+
+@lru_cache(maxsize=4096)
+def _inked(emb: hb.Font, gid: int) -> bool:
+    return bool(_outlines(emb, gid))
 
 
 def _blank(g) -> bool:
@@ -794,6 +806,36 @@ def _split_columns(segments: list[dict]) -> list[dict]:
     return out
 
 
+JOIN_GAP_EM = 8.0  # widest justified gap rejoined
+
+
+def _rejoin_justified(segments: list[dict], rules: Rules) -> list[dict]:
+    """A justified line can have a gap wide enough to split it (one long word
+    pushed to the next line). Join the pieces again when a nearby line runs
+    from the first piece's start past the gap to (at least) the last piece's
+    end: one paragraph. Table cells never have such a neighbour."""
+    out = list(segments)  # (keeps the order lines were found in)
+    ordered = sorted(out, key=lambda s: (s["baseline"], s["x0"]))
+    i = 0
+    while i < len(ordered) - 1:
+        a, b = ordered[i], ordered[i + 1]
+        size = max(g[5] for g in a["glyphs"])
+        if (abs(a["baseline"] - b["baseline"]) < 0.5 and a["x1"] < b["x0"] < a["x1"] + JOIN_GAP_EM * size
+                and not (rules.v and rules.vertical_between(a["x1"], b["x0"], a["baseline"] - 0.3 * size))
+                and any(t is not a and t is not b and 0 < abs(t["baseline"] - a["baseline"]) <= 3 * size
+                        and abs(t["x0"] - a["x0"]) <= 2 and t["x1"] >= b["x1"] - 0.5 * size  # marks overhang
+                        and not _gaps(t) for t in out)):
+            joined = {"baseline": a["baseline"], "glyphs": a["glyphs"] + b["glyphs"],
+                      "x0": a["x0"], "x1": b["x1"]}
+            out[next(k for k, t in enumerate(out) if t is a)] = joined
+            out.remove(b)
+            ordered[i] = joined
+            del ordered[i + 1]
+        else:
+            i += 1
+    return out
+
+
 def _is_mark(ucs: int, bbox, size: float) -> bool:
     return 0x17B6 <= ucs <= 0x17D3 or ucs == 0x17DD or (bbox[2] - bbox[0]) < 0.05 * size
 
@@ -819,6 +861,10 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = (),
         col = tuple(sp["color"])[:3] if len(sp["color"]) >= 3 else (sp["color"][0],) * 3
         for c in sp["chars"]:
             uni = chr(c[0]) if c[0] > 0 else ""
+            if uni == " " and dec is not None and c[1] >= 0 and _inked(dec.emb, c[1]):
+                # Word maps some letters (ណ in Khmer OS) to " " in the text layer;
+                # the outline says it is a letter, so let the decoder read it
+                uni = "\ufffd"
             if c[1] < 0 and glyphs:  # continuation of the previous glyph's ToUnicode text
                 g = glyphs[-1]
                 glyphs[-1] = g[:4] + (g[4] + uni,) + g[5:]
@@ -862,7 +908,7 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = (),
         seg["x0"] = min(seg["x0"], bbox[0])
         seg["x1"] = max(seg["x1"], bbox[2])
 
-    segments = _split_columns(segments)
+    segments = _rejoin_justified(_split_columns(segments), rules)
     for seg in segments:
         seg["glyphs"] = _invisible_spaces(seg["glyphs"])
 
