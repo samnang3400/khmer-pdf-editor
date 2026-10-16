@@ -11,7 +11,9 @@ when they write it. This one shapes Khmer correctly and keeps the text searchabl
 | **Text layer**: shaped glyphs have no 1:1 Unicode value | Copy/search gives junk like `ĮĦអនÌរ` | Visible glyphs are drawn as **vector outlines** (not text). An **invisible Unicode layer** in a glyph-less font, the way OCR'd PDFs work, holds the real text |
 | **Line wrapping**: Khmer has no spaces between words | Wraps only at spaces, or mid-character | Wraps at spaces and zero-width spaces (ZWSP), with orthographic-syllable fallback |
 | **Broken Khmer PDFs** (Word, older tools): text stored in visual order, lost subscripts, junk like `េសចក្តីបញចប់`, `ǒថប័ន` | Copy, search and editing give that junk | **Recovers the real text from the glyphs**: the PDF still holds the font's glyph IDs, so a HarfBuzz-built reverse dictionary for the same font (Khmer OS family bundled) turns them back into Unicode, checked against the embedded font's outlines first |
-| **Editing existing Khmer** | Often impossible | Click a line and **edit it in place** on the page, in the document's own font; the old line is removed and the new one drawn on the same baseline |
+| **Editing existing Khmer** | Often impossible | Click a line or paragraph and **edit it in place** on the page, in the document's own font; the old text is removed and the new text drawn on the same baseline |
+| **Legacy Limon fonts** | Show ASCII junk like `km<uCa` when copied | **Converts Limon text to Unicode** (`កម្ពុជា`) for editing, and can rewrite the whole document in a Unicode font |
+| **Scanned pages** | Not editable; MuPDF's built-in OCR drops Khmer subscripts (`ក្តី` → `ក្ី`) | **OCR with the Tesseract program itself** (keeps `ក្តី` intact), added as an invisible text layer so scans become searchable and editable |
 
 Copy, search and extraction are tested in the engines behind the viewers people actually use (`tests/`):
 **MuPDF** (this app), **PDFium** (Chrome/Edge), **pdf.js** (Firefox) and **Poppler/xpdf**.
@@ -19,12 +21,25 @@ The pdf.js test runs when `PDFJS_DIR` points to a folder containing `node_module
 
 Lines written by the app also store their own text, font, size and colour, so editing them is exact.
 
-## Features (v0.3)
+## Features
 
-- Open, view, zoom, and page through PDFs (drag and drop works too)
-- **Edit Text**: click any line and edit it right on the page (Enter = save, Shift+Enter = new line,
-  Esc = cancel, clicking elsewhere saves). Text from broken Khmer PDFs is recovered first. An edited
-  line keeps the original's width (justified paragraphs keep their right edge)
+- Open, view, zoom, and page through PDFs (drag and drop works too), with a page-thumbnail sidebar,
+  recent files and a light/dark interface that follows the Windows setting
+- **Edit Text**: click any line or paragraph and edit it right on the page (Enter = save, Shift+Enter =
+  new line, Esc = cancel, clicking elsewhere saves). Text from broken Khmer PDFs is recovered first.
+  An edited line keeps the original's width (justified paragraphs keep their right edge)
+- **Paragraphs**: lines that flow on (same font and size, regular spacing, aligned edges) are edited
+  as one paragraph and re-wrapped inside its width; justified paragraphs stay justified. Text added
+  with the app keeps its exact paragraph
+- **Select** (V): click text to select it, drag it to **move** it, drag a side handle to change its
+  **width** (the text re-wraps), a corner to make it **bigger or smaller**, and press Delete to
+  **delete** it. Double-click to edit
+- **Limon → Unicode**: text in the legacy Limon fonts (Limon S1, R1, F1…) is converted to Unicode Khmer
+  when you edit it; **Convert Limon** rewrites all of it in a Unicode font, in place, so it can be
+  searched and copied
+- **Recognize Text (OCR)** for scanned pages (this page or all pages): the recognised text becomes an
+  invisible, searchable layer, and each line can be edited (the scanned text is painted out with the
+  paper colour). OCR text is outlined in orange as *please check*
 - **Recovery of broken Khmer PDFs**: the PDF's font is identified by its glyph *shapes* (works for
   renamed fonts and renumbered subsets) against the bundled Khmer OS fonts and fonts installed on the PC;
   differences in glyph order between Word and HarfBuzz are tolerated. When no font matches, the text is
@@ -46,18 +61,25 @@ python run.py [file.pdf]
 python -m pytest -q tests
 ```
 
+OCR needs the Tesseract program (the Windows installer bundles it). From source, install it
+(`sudo apt install tesseract-ocr`, or the UB Mannheim build on Windows) or point
+`KHMERPDF_TESSERACT` at `tesseract.exe`; the OCR tests are skipped without it. The Khmer and English
+language data ship in `khmerpdf/tessdata`.
+
 Code map:
 
 - `khmerpdf/engine.py`: shaping, PDF writing (visible + invisible layers), reading/editing lines
 - `khmerpdf/recover.py`: recovering real text from broken Khmer PDFs
 - `khmerpdf/linebreak.py`: Khmer-aware wrapping
-- `khmerpdf/app.py`: PySide6 GUI
+- `khmerpdf/legacy.py`: Limon → Unicode
+- `khmerpdf/ocr.py`: Tesseract OCR (hOCR) for scanned pages
+- `khmerpdf/app.py`, `khmerpdf/theme.py`: PySide6 GUI, colours and icons
 - `tools/make_glyphless_font.py`: regenerates `fonts/glyphless/GlyphLess.ttf` (dev only)
 
 ## Building the Windows installer
 
-**Automatic (recommended):** push to GitHub. `.github/workflows/build-windows.yml` runs the tests,
-builds the app with PyInstaller, smoke-tests it, and compiles `KhmerPDF-Setup-<version>.exe`
+**Automatic (recommended):** push to GitHub. `.github/workflows/build-windows.yml` installs Tesseract,
+runs the tests, builds the app with PyInstaller (bundling `tesseract.exe` and its DLLs), smoke-tests it, and compiles `KhmerPDF-Setup-<version>.exe`
 with Inno Setup. Download it from the run's *Artifacts*. Pushing a tag like `v0.1.0` also attaches
 it to a GitHub Release.
 
@@ -65,6 +87,8 @@ it to a GitHub Release.
 
 ```bat
 pip install -r requirements-dev.txt
+:: optional, for OCR: copy tesseract.exe and its *.dll files from a Tesseract install
+:: (e.g. C:\Program Files\Tesseract-OCR) into build-deps\tesseract\
 pyinstaller --noconfirm khmerpdf.spec
 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=0.1.0 installer\khmerpdf.iss
 ```
@@ -74,12 +98,15 @@ and optionally adds KhmerPDF to *Open with* for PDFs without changing the defaul
 
 ## Known limitations / roadmap
 
-- **Next:** recovery for broken PDFs in fonts we don't have (OCR with Tesseract `khm`), scanned PDFs,
-  Limon (legacy) → Unicode conversion; dictionary-based Khmer word segmentation, so wrapping works
-  without ZWSP; move/resize/delete text boxes; reflow when editing a paragraph
+- **Next:** dictionary-based Khmer word segmentation, so wrapping works without ZWSP; other legacy
+  fonts (ABC, Baidok…); using OCR to check text rebuilt without its font
 - **Phase 3:** page operations (merge, split, rotate, reorder), form filling, signatures, annotations
 - Rotated pages are supported for adding text, but less tested than upright pages
-- Editing changes one line at a time; a justified paragraph doesn't reflow yet
+- A paragraph that grows when edited isn't moved out of the way of text below it
+- Paragraph detection is deliberately cautious: lines in tables or columns stay separate lines
+- Moving or resizing text from another PDF redraws it; if its font isn't available it is drawn in
+  the toolbar's font. First-line indents are not kept when a paragraph re-wraps
+- OCR quality depends on the scan (300 dpi works best); the bundled "fast" models favour speed
 - Exact recovery needs the same font the PDF used (bundled Khmer OS fonts, or one installed on the PC).
   Without it, the rule-based repair gets most syllables right but can't see letters hidden in ligatures
   (e.g. `ា` in Khmer OS's `កា` glyph). Spellings that look identical (`ក្ត`/`ក្ដ`) come back in their
@@ -93,3 +120,6 @@ PyMuPDF is **AGPL-3.0**. Internal use at the school is fine. Distributing the ap
 releasing this source under the AGPL or buying a commercial PyMuPDF license from Artifex.
 Bundled fonts: Battambang and Moul are SIL OFL 1.1 (`khmerpdf/fonts/OFL.txt`); the Khmer OS fonts are
 LGPL-2.1 (`khmerpdf/fonts/khmeros/COPYRIGHT-KhmerOS.txt`).
+The Limon character table in `khmerpdf/legacy.py` is derived from khmerconverter's `fontdata.xml`
+(Khmer OS project, LGPL-2.1). Tesseract OCR and its language data (`khmerpdf/tessdata`) are
+Apache-2.0.
