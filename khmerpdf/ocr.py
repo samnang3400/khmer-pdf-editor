@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 
 import pymupdf
@@ -134,7 +135,31 @@ def run(png: bytes, dpi: int = OCR_DPI, origin=(0, 0)) -> list[OcrLine]:
     res = subprocess.run(cmd, input=png, capture_output=True, timeout=300, creationflags=flags)
     if res.returncode != 0:
         raise RuntimeError(res.stderr.decode("utf-8", "replace").strip() or "Tesseract failed")
-    return parse_hocr(res.stdout.decode("utf-8", "replace"), 72 / dpi, tuple(origin))
+    return clean(parse_hocr(res.stdout.decode("utf-8", "replace"), 72 / dpi, tuple(origin)))
+
+
+JUNK_CONFIDENCE = 15  # below this a line is noise (a border, an ornament, a speck)
+
+
+def clean(lines: list[OcrLine]) -> list[OcrLine]:
+    """Drop noise lines and put right Tesseract's usual Khmer mistakes."""
+    from .ocrfix import correct
+
+    def khmer(t):
+        return any("\u1780" <= c <= "\u17ff" for c in t)
+    khmer_page = sum(khmer(ln.text) for ln in lines) > len(lines) / 2
+    out = []
+    for ln in lines:
+        visible = [c for c in ln.text if not c.isspace()]
+        if ln.confidence < JUNK_CONFIDENCE:
+            continue
+        if khmer_page and not khmer(ln.text) and len(visible) <= 3 and not any(c.isdigit() for c in visible):
+            continue  # "A", "r=" on a Khmer page: an ornament read as letters
+        letters = sum(1 for c in visible if "\u1780" <= c <= "\u17b3" or c.isalpha() and c.isascii())
+        if letters < 2 and ln.confidence < 60 and not all(c.isdigit() or c in ".-()" for c in visible):
+            continue  # "ជ", ">ៗ2=0": a speck or a border, not a page number
+        out.append(dataclass_replace(ln, text=correct(ln.text)))
+    return out
 
 
 SCAN_COVER = 0.8  # an image covering this much of the page is a scan; smaller ones are pictures
