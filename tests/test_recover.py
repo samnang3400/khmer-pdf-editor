@@ -326,8 +326,10 @@ def test_recovery_needs_no_library_the_app_does_not_ship(tmp_path):
         f"page = pymupdf.open({str(Path(__file__).parent / 'fixtures' / 'word_khmeros6_page.pdf')!r})[0]\n"
         "print('\\n'.join(ln.text for ln in find_lines(page)))\n")
     env = {**os.environ, "KHMERPDF_CACHE": str(tmp_path),  # tables built here, not reused
-           "PYTHONPATH": str(Path(__file__).parent.parent)}
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=600)
+           "PYTHONPATH": str(Path(__file__).parent.parent),
+           "PYTHONIOENCODING": "utf-8"}  # Windows consoles default to cp1252: no Khmer
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, encoding="utf-8",
+                         env=env, timeout=600)
     assert out.returncode == 0, out.stderr
     for want in ("ក្រោយពេលរៀនចប់សិស្សនឹងមាន", "ត្រឹមត្រូវ", "សៀវភៅ", "ដែលទាក់ទងនឹងមេរៀននេះ"):
         assert want in out.stdout, want
