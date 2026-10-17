@@ -2,7 +2,7 @@
 ; Build:  iscc /DAppVersion=0.1.0 installer\khmerpdf.iss
 
 #ifndef AppVersion
-  #define AppVersion "0.5.4"
+  #define AppVersion "0.5.5"
 #endif
 #define AppName "KhmerPDF Editor"
 #define AppExe "KhmerPDF.exe"
