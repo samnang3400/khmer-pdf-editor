@@ -309,3 +309,25 @@ def test_khmer_os_6_decoded_with_the_bundled_google_fonts(monkeypatch):
     for want in ("សុខភាពបឋម", "ក្រោយពេលរៀនចប់សិស្សនឹងមាន", "ត្រឹមត្រូវ", "សៀវភៅ",
                  "គោរពគ្នាទៅវិញទៅមក", "ដែលទាក់ទងនឹងមេរៀននេះ"):
         assert want in text, want
+
+
+def test_recovery_needs_no_library_the_app_does_not_ship(tmp_path):
+    """The packaged app excludes fontTools (khmerpdf.spec): 0.5.4 removed morx
+    with it, the import failed silently in the installed app, and Khmer OS 6.00
+    PDFs came out broken there while every test passed here. Decode the page
+    in a process where fontTools can't be imported."""
+    import os
+    import subprocess
+    import sys
+    code = (
+        "import sys; sys.modules['fontTools'] = None\n"
+        "import pymupdf\n"
+        "from khmerpdf.recover import find_lines\n"
+        f"page = pymupdf.open({str(Path(__file__).parent / 'fixtures' / 'word_khmeros6_page.pdf')!r})[0]\n"
+        "print('\\n'.join(ln.text for ln in find_lines(page)))\n")
+    env = {**os.environ, "KHMERPDF_CACHE": str(tmp_path),  # tables built here, not reused
+           "PYTHONPATH": str(Path(__file__).parent.parent)}
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=600)
+    assert out.returncode == 0, out.stderr
+    for want in ("ក្រោយពេលរៀនចប់សិស្សនឹងមាន", "ត្រឹមត្រូវ", "សៀវភៅ", "ដែលទាក់ទងនឹងមេរៀននេះ"):
+        assert want in out.stdout, want

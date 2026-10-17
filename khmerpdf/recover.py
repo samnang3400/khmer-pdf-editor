@@ -50,7 +50,7 @@ def _norm(name: str) -> str:
 # --------------------------------------------------------------------------
 # Reverse dictionary per reference font
 # --------------------------------------------------------------------------
-CACHE_VERSION = 9  # bump when _build changes in a way the tables below don't show
+CACHE_VERSION = 10  # 9: 0.5.4 packaged without fontTools built morx-shaped tables  # bump when _build changes in a way the tables below don't show
 
 
 def _cache_dir() -> Path:
@@ -71,18 +71,37 @@ def _without_morx(data: bytes) -> bytes:
     face = hb.Face(data)
     if not {"GSUB", "morx"} <= set(face.table_tags):
         return data
-    import io
-    from fontTools.ttLib import TTFont
+    return _drop_tables(data, AAT_TABLES)
+
+
+AAT_TABLES = (b"morx", b"mort", b"feat", b"prop")
+
+
+def _drop_tables(data: bytes, drop: tuple[bytes, ...]) -> bytes:
+    """The font file without the given tables: a plain sfnt rewrite, so it
+    needs no font library (the packaged app has none). Returns `data`
+    itself if there is nothing to drop or it can't be read."""
+    import struct
     try:
-        t = TTFont(io.BytesIO(data))
-        for k in ("morx", "mort", "feat", "prop"):
-            if k in t:
-                del t[k]
-        out = io.BytesIO()
-        t.save(out)
-        return out.getvalue()
-    except Exception:
+        version, num = struct.unpack(">4sH", data[:6])
+        recs = [struct.unpack(">4sIII", data[12 + 16 * i: 28 + 16 * i]) for i in range(num)]
+    except struct.error:
         return data
+    keep = [r for r in recs if r[0] not in drop]
+    if len(keep) == len(recs):
+        return data
+    n = len(keep)
+    pow2 = 1 << (n.bit_length() - 1)
+    head = struct.pack(">4sHHHH", version, n, pow2 * 16, pow2.bit_length() - 1, n * 16 - pow2 * 16)
+    offset = 12 + 16 * n
+    dirs, bodies = [], []
+    for tag, check, off, length in keep:
+        body = data[off: off + length]
+        dirs.append(struct.pack(">4sIII", tag, check, offset, length))
+        body += b"\0" * (-len(body) % 4)
+        bodies.append(body)
+        offset += len(body)
+    return head + b"".join(dirs) + b"".join(bodies)
 
 
 class GlyphDecoder:
@@ -201,18 +220,9 @@ class GlyphDecoder:
     def _plain(self) -> hb.Font | None:
         """The same font without its morx: HarfBuzz's own Khmer shaper then
         reorders pre-base vowels and uses the plain cmap glyphs."""
-        import io
-        from fontTools.ttLib import TTFont
-        try:
-            t = TTFont(io.BytesIO(Path(self.path).read_bytes()))
-            for k in ("morx", "mort", "feat", "prop"):
-                if k in t:
-                    del t[k]
-            out = io.BytesIO()
-            t.save(out)
-            return hb.Font(hb.Face(out.getvalue()))
-        except Exception:
-            return None
+        data = Path(self.path).read_bytes()
+        plain = _drop_tables(data, AAT_TABLES)
+        return hb.Font(hb.Face(plain)) if plain is not data else None
 
     def _shape_with(self, font: hb.Font, text: str) -> tuple[int, ...]:
         buf = hb.Buffer()
