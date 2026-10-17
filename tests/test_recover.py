@@ -277,3 +277,35 @@ def test_a_justified_line_split_at_a_wide_gap_is_joined_again():
     # table cells: no line spans the gap, so they stay apart
     cells = [seg(72, 130, 100), seg(170, 300, 100), seg(72, 130, 113), seg(170, 300, 113)]
     assert len(_rejoin_justified(cells, Rules(h=[], v=[]))) == 4
+
+
+def test_word_khmer_os_6_decoded_with_its_own_embedded_font():
+    """Word 2021 with Khmer OS 6.00 (2010): the embedded fonts carry only
+    Apple morx tables and match none of the bundled 1.10 fonts. They are
+    whole fonts, though, so the PDF's own copy is the reference. A page of
+    the MoEYS grade-2 health teacher's book."""
+    from khmerpdf.recover import find_lines
+    page = pymupdf.open(Path(__file__).parent / "fixtures" / "word_khmeros6_page.pdf")[0]
+    text = "\n".join(ln.text for ln in find_lines(page))
+    for want in ("សមាសភាគទី១", "សុខភាពបឋម", "មេរៀនទី",            # ស read as រ, េ as ល
+                 "ក្រោយពេលរៀនចប់សិស្សនឹងមាន",                   # pre-base េ and ្រ
+                 "ត្រឹមត្រូវ", "ដែលទាក់ទងនឹងមេរៀននេះ", "នៃ",     # ្រ ែ ៃ
+                 "សៀវភៅ", "គោរពគ្នាទៅវិញទៅមក",                  # ៅ (consonant + ៅ glyph)
+                 "ឥរិយាបថល្អក្នុងការបរិភោគអាហារ", "គ្រូពិនិត្យវត្តមាន"):
+        assert want in text, want
+    for junk in ("លម្លរៀន", "ស្គូ", "ខដល", "សៀវលៅ", "អាហារ្រ"):
+        assert junk not in text, junk
+
+
+def test_khmer_os_6_decoded_with_the_bundled_google_fonts(monkeypatch):
+    """The same page when Word embeds only a subset (no whole font to fall
+    back on): the Google Fonts builds of Khmer OS 6.00 in fonts/reference
+    match it, and are shaped with GSUB as Word does (HarfBuzz would prefer
+    their morx, which fuses pre-base vowels into the consonant)."""
+    from khmerpdf import recover
+    monkeypatch.setattr(recover, "embedded_references", lambda doc: {})
+    page = pymupdf.open(Path(__file__).parent / "fixtures" / "word_khmeros6_page.pdf")[0]
+    text = "\n".join(ln.text for ln in recover.find_lines(page))
+    for want in ("សុខភាពបឋម", "ក្រោយពេលរៀនចប់សិស្សនឹងមាន", "ត្រឹមត្រូវ", "សៀវភៅ",
+                 "គោរពគ្នាទៅវិញទៅមក", "ដែលទាក់ទងនឹងមេរៀននេះ"):
+        assert want in text, want

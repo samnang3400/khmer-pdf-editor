@@ -50,7 +50,7 @@ def _norm(name: str) -> str:
 # --------------------------------------------------------------------------
 # Reverse dictionary per reference font
 # --------------------------------------------------------------------------
-CACHE_VERSION = 3  # bump when _build changes in a way the tables below don't show
+CACHE_VERSION = 9  # bump when _build changes in a way the tables below don't show
 
 
 def _cache_dir() -> Path:
@@ -63,11 +63,37 @@ def _cache_dir() -> Path:
     return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "khmerpdf"
 
 
+def _without_morx(data: bytes) -> bytes:
+    """A font with both OpenType (GSUB) and Apple (morx) tables, as the
+    Khmer OS 6.00 / Google Fonts builds are: HarfBuzz prefers morx, which
+    fuses pre-base vowels and ្រ into the consonant; Word shapes with GSUB,
+    which keeps them apart. Shape as Word does."""
+    face = hb.Face(data)
+    if not {"GSUB", "morx"} <= set(face.table_tags):
+        return data
+    import io
+    from fontTools.ttLib import TTFont
+    try:
+        t = TTFont(io.BytesIO(data))
+        for k in ("morx", "mort", "feat", "prop"):
+            if k in t:
+                del t[k]
+        out = io.BytesIO()
+        t.save(out)
+        return out.getvalue()
+    except Exception:
+        return data
+
+
 class GlyphDecoder:
     def __init__(self, path: str):
         self.path = path
         data = Path(path).read_bytes()
-        self.font = hb.Font(hb.Face(data))
+        plain = _without_morx(data)
+        self.font = hb.Font(hb.Face(plain))
+        # ... but tools that shape with HarfBuzz (MuPDF, LibreOffice) used its
+        # morx: learn that drawing too
+        self._also = [hb.Font(hb.Face(data))] if plain is not data else []
         self.seq: dict[tuple[int, ...], str] = {}
         self.single: dict[int, str] = {}
         # Building takes about a second per font; it is kept on disk, keyed by
@@ -98,6 +124,15 @@ class GlyphDecoder:
                 g = self._shape(c + x)
                 if len(g) >= 2 and g[0] not in base:
                     self.prebase.add(g[0])
+        if self._aat_only:  # drawn first by Word, though morx fuses them (see _word_shapes)
+            self.prebase |= {self.font.get_nominal_glyph(ord(v)) for v in "េែៃ"} - {None}
+            if self._pre_ro is not None:
+                self.prebase.add(self._pre_ro)
+        if self._aat_only or self._also:
+            # ... and never end one: morx shapes some rare spellings (រ្រ) with
+            # ្រ's pre-base glyph last, which then swallows the next syllable's ្រ
+            self.seq = {k: t for k, t in self.seq.items() if len(k) == 1 or k[-1] not in self.prebase}
+            self.maxlen = max(len(k) for k in self.seq)
         # Base glyphs (a consonant / independent vowel, alone or ligated with
         # its vowel): a syllable has exactly one, so a window with two spans
         # two syllables.
@@ -146,9 +181,133 @@ class GlyphDecoder:
         return tuple(i.codepoint for i in buf.glyph_infos)
 
     def _add(self, text: str) -> None:
-        g = self._shape(text)
-        if 0 not in g and g not in self.seq:  # first (= canonical) spelling wins
-            self.seq[g] = text
+        for g in (self._shape(text), *self._word_shapes(text),
+                  *(self._shape_with(f, text) for f in self._also)):
+            if 0 not in g and g not in self.seq:  # first (= canonical) spelling wins
+                self.seq[g] = text
+
+    # Fonts with only Apple (morx) shaping tables: Word embeds Khmer OS 6.00
+    # that way, having dropped GSUB, but drew the text through the GSUB it
+    # had. HarfBuzz's morx shaping fuses pre-base vowels and ្រ into the
+    # consonant, which Word didn't: it drew the vowel's own glyph and ្រ's
+    # pre-base glyph first, then the rest of the syllable as the font shapes
+    # it. These shapes add that drawing to the table.
+    @cached_property
+    def _aat_only(self) -> bool:
+        tags = set(self.font.face.table_tags)
+        return "morx" in tags and "GSUB" not in tags
+
+    @cached_property
+    def _plain(self) -> hb.Font | None:
+        """The same font without its morx: HarfBuzz's own Khmer shaper then
+        reorders pre-base vowels and uses the plain cmap glyphs."""
+        import io
+        from fontTools.ttLib import TTFont
+        try:
+            t = TTFont(io.BytesIO(Path(self.path).read_bytes()))
+            for k in ("morx", "mort", "feat", "prop"):
+                if k in t:
+                    del t[k]
+            out = io.BytesIO()
+            t.save(out)
+            return hb.Font(hb.Face(out.getvalue()))
+        except Exception:
+            return None
+
+    def _shape_with(self, font: hb.Font, text: str) -> tuple[int, ...]:
+        buf = hb.Buffer()
+        buf.add_str(text)
+        buf.guess_segment_properties()
+        hb.shape(font, buf, {})
+        return tuple(i.codepoint for i in buf.glyph_infos)
+
+    @cached_property
+    def _pre_ro(self) -> int | None:
+        """The glyph morx draws for ្រ before the consonant: the inked glyph
+        that C+្រ adds to C, for nearly every consonant."""
+        from collections import Counter
+        count: Counter = Counter()
+        for c in CONS:
+            alone = set(self._shape(c))
+            count.update(set(g for g in self._shape(c + "្រ") if g not in alone and _outlines(self.font, g)))
+        best = count.most_common(1)
+        return best[0][0] if best and best[0][1] >= len(CONS) // 2 else None
+
+    def _contours(self, g: int) -> list[tuple]:
+        out, cur = [], []
+        for op in _outlines(self.font, g):
+            cur.append(op)
+            if op[0] == "Z":
+                out.append(tuple(cur))
+                cur = []
+        return out
+
+    def _add_au_ligatures(self) -> None:
+        """Word draws ៅ as េ + a glyph joining the consonant to ៅ's right-hand
+        part, which morx never produces (it fuses the whole syllable). That
+        glyph is the consonant+ា glyph with ា's contour swapped for another:
+        same width, the consonant's contours otherwise. Look-alike consonants
+        (ច ថ ធ ផ) can't be told apart that way; the font keeps these glyphs
+        in consonant order, so the order settles them."""
+        from collections import Counter
+        used = {g for k in self.seq for g in k}
+        pre_e = self.font.get_nominal_glyph(ord("េ"))
+        if pre_e is None:
+            return
+        by_adv: dict[int, list[int]] = {}
+        for g in range(self.font.face.glyph_count):
+            if g not in used:
+                by_adv.setdefault(self.font.get_glyph_h_advance(g), []).append(g)
+        cands: dict[int, list[int]] = {}  # consonant index -> glyphs
+        for i, c in enumerate(CONS):
+            aa = self._shape(c + "ា")
+            if len(aa) != 1:
+                continue
+            ca = self._contours(aa[0])
+            for u in by_adv.get(self.font.get_glyph_h_advance(aa[0]), ()):
+                cu = self._contours(u)
+                if (len(cu) == len(ca) and sum(1 for x in cu if x not in ca) == 1
+                        and sum(1 for x in ca if x not in cu) == 1):
+                    cands.setdefault(i, []).append(u)
+        offsets = Counter(us[0] - i for i, us in cands.items() if len(us) == 1)
+        if not offsets:
+            return
+        offset, agree = offsets.most_common(1)[0]
+        if agree < len(CONS) // 2:
+            return  # not a block in consonant order: don't guess
+        for i, us in cands.items():
+            u = offset + i
+            if u not in us:
+                continue
+            self.seq.setdefault((pre_e, u), CONS[i] + "ៅ")
+            if self._pre_ro is not None:
+                self.seq.setdefault((pre_e, self._pre_ro, u), CONS[i] + "្រៅ")
+
+    def _word_shapes(self, text: str) -> list[tuple[int, ...]]:
+        if not self._aat_only or self._plain is None or not text or not ("ក" <= text[0] <= "អ"):
+            return []
+        plain = self._shape_with(self._plain, text)
+        prebase = {self.font.get_nominal_glyph(ord(v)) for v in "េែៃ"} - {None}
+        pre = [g for g in plain[:1] if g in prebase]
+        core = text
+        right: tuple[int, ...] = ()
+        for v in "េែៃោៅៀឿើ":
+            if v in core:
+                # Word ligates ោ's right-hand part like ា (កោ: the កា glyph)
+                core = core.replace(v, "ា" if v == "ោ" else "")
+                if v not in "េែៃោ":
+                    # the vowel's right-hand part, as the plain shaper draws it
+                    base = set(self._shape_with(self._plain, text[0]))
+                    right = tuple(g for g in self._shape_with(self._plain, text[0] + v)
+                                  if g not in base and g not in prebase)
+                break
+        if "្រ" in core and self._pre_ro is not None:
+            pre.append(self._pre_ro)
+            core = core.replace("្រ", "")
+        if not pre:
+            return []
+        body = self._shape(core) if core else ()
+        return [tuple(pre) + body + right, tuple(pre) + body[:1] + right + body[1:]]
 
     def _build(self) -> None:
         add = self._add
@@ -187,6 +346,8 @@ class GlyphDecoder:
         for c in INDEP:
             for s1 in SECOND_SUBS:  # ឱ្យ
                 add(c + s1)
+        if self._aat_only:
+            self._add_au_ligatures()
         # Fallback for glyphs met outside a known syllable: what a single glyph
         # stands for when it follows a base consonant.
         for g, t in self.seq.items():
@@ -266,6 +427,13 @@ def reference_fonts() -> dict[str, str]:
     for name, path in bundled_fonts().items():  # e.g. 'Khmer OS System' and 'KhmerOSsys'
         refs.setdefault(_norm(Path(path).stem), path)
         refs.setdefault(_norm(name), path)
+    # Other versions of the same fonts, for reading PDFs only (not offered for
+    # editing): Khmer OS 6.00 as Google Fonts ships it (Content, Siemreap,
+    # Moul ...), the Kh-* 2008 builds, more Khmer OS families. A font's
+    # version decides whether its glyphs match a PDF, not its name.
+    for p in sorted((FONT_DIR / "reference").glob("*.ttf")):
+        refs.setdefault(_norm(p.stem), str(p))
+        refs.setdefault("ref:" + p.name, str(p))  # a name the bundled fonts already use
     for name, path in system_khmer_fonts().items():
         refs.setdefault(_norm(Path(path).stem), path)
         refs.setdefault(_norm(name), path)
@@ -373,6 +541,25 @@ def _like_marks(path: str, emb: hb.Font, g: int, ops: tuple) -> tuple[int, ...]:
 SAME_FONT = 0.6  # this share of glyphs matching exactly by ID proves it is the same font
 
 
+@lru_cache(maxsize=None)
+def _widths(path: str) -> tuple[int, frozenset[int]]:
+    font = _ref_font(path)
+    return font.face.upem, frozenset(font.get_glyph_h_advance(g) for g in range(font.face.glyph_count))
+
+
+def _widths_fit(emb: hb.Font, ref_path: str, gids: list[int]) -> bool:
+    """Whether the reference font could be this embedded font: subsets keep
+    each glyph's advance width, so (nearly) every drawn glyph's width must be
+    one the reference font has. Fonts of another design fail at once."""
+    upem, widths = _widths(ref_path)
+    scale = upem / emb.face.upem
+    drawn = [g for g in gids if g < emb.face.glyph_count and _outlines(emb, g)]
+    if not drawn:
+        return True
+    fit = sum(1 for g in drawn if round(emb.get_glyph_h_advance(g) * scale) in widths)
+    return fit >= 0.9 * len(drawn)
+
+
 def _glyph_map(emb: hb.Font, ref_path: str, gids: list[int], known_drawn: int = 0,
                known_missing: int = 0, named: bool = False) -> tuple[dict[int, tuple[int, ...]], int, int] | None:
     """Map the embedded font's glyph IDs to the reference font's, by outline.
@@ -383,6 +570,8 @@ def _glyph_map(emb: hb.Font, ref_path: str, gids: list[int], known_drawn: int = 
     Slightly redrawn glyphs (another version of the font) count when the
     glyph IDs prove it's the same font - or when the PDF names this font and
     nearly every glyph has its metrics (`named`)."""
+    if not _widths_fit(emb, ref_path, gids):
+        return None  # cheap: the outline index below takes ~0.1 s per font
     index = _shape_index(ref_path)
     ref_font = _ref_font(ref_path)
     mapping: dict[int, tuple[int, ...]] = {}
@@ -492,17 +681,74 @@ class MappedDecoder:
         return text, misses
 
 
-def _identify(doc: pymupdf.Document, xref: int, preferred: str | None, gids: list[int]) -> MappedDecoder | None:
-    """Find which reference font (bundled or installed) the PDF's embedded
-    font is, by glyph outlines - not by name, which is often renamed."""
+def _complete_font(buf: bytes) -> bool:
+    """A whole font, not a subset: every Khmer consonant in its cmap, and the
+    tables HarfBuzz needs to shape Khmer (OpenType GSUB, or the Apple morx
+    that FontForge builds of Khmer OS 6.00 carry)."""
     try:
-        buf = doc.extract_font(xref)[3]
+        face = hb.Face(buf)
+        font = hb.Font(face)
+    except Exception:
+        return False
+    if not {"GSUB", "morx"} & set(face.table_tags):
+        return False
+    return all(font.get_nominal_glyph(ord(c)) for c in CONS)
+
+
+def embedded_references(doc: pymupdf.Document) -> dict[str, str]:
+    """The PDF's own complete Khmer fonts, saved as reference font files
+    (normalised name -> path). Word embeds some fonts whole: the exact
+    version the document was made with, which is the best reference there
+    is - Khmer OS 6.00 (2010) draws its glyphs differently from the 1.10
+    bundled here, so nothing else matches it."""
+    cached = getattr(doc, "_khmerpdf_embedded", None)
+    if cached is not None:
+        return cached
+    import hashlib
+    out: dict[str, str] = {}
+    seen: set[int] = set()
+    for page in doc:
+        for xref, _ext, _ftype, basefont, *_ in page.get_fonts(full=True):
+            if xref in seen:
+                continue
+            seen.add(xref)
+            try:
+                buf = doc.extract_font(xref)[3]
+            except Exception:
+                continue
+            if not buf or not _complete_font(buf):
+                continue
+            path = _cache_dir() / f"embedded-{hashlib.sha1(buf).hexdigest()}.ttf"
+            try:
+                if not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(buf)
+            except OSError:
+                continue
+            out.setdefault(_norm(basefont), str(path))
+    try:
+        doc._khmerpdf_embedded = out
+    except AttributeError:
+        pass
+    return out
+
+
+def _identify(doc: pymupdf.Document, xref: int, preferred: str | None, gids: list[int]) -> MappedDecoder | None:
+    """Find which reference font the PDF's embedded font is, by glyph
+    outlines - not by name, which is often renamed. The bundled and installed
+    fonts are tried first (their tables are cached between documents), then
+    the PDF's own complete copy of a font with this name, then its others."""
+    try:
+        basefont, _ext, _type, buf = doc.extract_font(xref)[:4]
     except Exception:
         return None
     if not buf:
         return None
     emb = hb.Font(hb.Face(buf))
-    candidates = list(dict.fromkeys(([preferred] if preferred else []) + list(reference_fonts().values())))
+    own = embedded_references(doc)
+    name = _norm(basefont or "")
+    candidates = list(dict.fromkeys(([preferred] if preferred else []) + list(reference_fonts().values())
+                                    + ([own[name]] if name in own else []) + list(own.values())))
     for path in candidates:
         md = MappedDecoder(path, emb, named=path == preferred)
         if md.extend(gids) and md.drawn:
