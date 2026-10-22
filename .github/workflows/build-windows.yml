@@ -66,9 +66,16 @@ jobs:
           }
           iscc /DAppVersion=${{ steps.ver.outputs.version }} installer\khmerpdf.iss
 
-      - uses: actions/upload-artifact@v7
+      # Only for runs started by hand (Actions > Run workflow): pushes and PRs just check the
+      # build, and tagged versions are kept on the Releases page. Artifacts count against the
+      # account's storage quota (shared by every repo), so a full quota must not fail the build.
+      - name: Keep the installer as an artifact
+        if: github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
         with:
           name: KhmerPDF-Setup-${{ steps.ver.outputs.version }}
+          retention-days: 3
           path: dist/KhmerPDF-Setup-*.exe
 
       - name: Attach to release
