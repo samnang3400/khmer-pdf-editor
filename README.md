@@ -70,6 +70,14 @@ Lines written by the app also store their own text, font, size and colour, so ed
   needed, since text wraps between dictionary words anyway
 - **Find** Khmer or English across the document (Ctrl+F)
 - Undo/redo, Save / Save As (saves atomically: never leaves a half-written file)
+- **Updates**: at start (at most once a day) and with **Help > Check for Updates**, the app looks at this
+  repository's latest release. If there is a newer version it shows what's new; **Update Now** downloads
+  the file for how the app was installed (the Windows setup, the AppImage or the .deb), checks its SHA-256
+  against GitHub's and the release's `SHA256SUMS-*.txt`, closes the app (asking about unsaved changes first),
+  installs it and opens the new version. The Windows setup updates in the same mode it was installed in (an
+  all-users install asks for admin once); the .deb asks for the password. The .tar.gz and source runs open
+  the release page instead. Nothing is installed without a matching checksum. Turn the automatic check off
+  in the Help menu
 - Bundled fonts: the **Khmer OS** family (System, Battambang, Siemreap, Content, Muol…), Battambang
   and Moul. Khmer fonts installed on the computer
   (Khmer UI, DaunPenh, Khmer OS…) are detected automatically, and any .ttf can be added
@@ -144,8 +152,8 @@ sudo apt install tesseract-ocr patchelf libxcb-cursor0
 pip install -r requirements-dev.txt
 installer/linux/bundle-tesseract.sh          # optional, for OCR: copies tesseract into build-deps/
 pyinstaller --noconfirm khmerpdf.spec
-installer/linux/build-appimage.sh 0.5.5      # needs appimagetool on PATH (or APPIMAGETOOL=...)
-installer/linux/build-deb.sh 0.5.5
+installer/linux/build-appimage.sh 0.6.0      # needs appimagetool on PATH (or APPIMAGETOOL=...)
+installer/linux/build-deb.sh 0.6.0
 ```
 
 An AppImage only runs on systems with the same or newer glibc as the PC that built it, so build on
@@ -174,8 +182,8 @@ To add it to the app menu, use a tool such as Gear Lever or AppImageLauncher.
 
 ## Licensing note
 
-PyMuPDF is **AGPL-3.0**. Internal use at the school is fine. Distributing the app means either
-releasing this source under the AGPL or buying a commercial PyMuPDF license from Artifex.
+KhmerPDF Editor is licensed under the **GNU AGPL-3.0** (see `LICENSE`), as PyMuPDF, which it is built
+on, requires for distributed apps.
 Bundled fonts: Battambang and Moul are SIL OFL 1.1 (`khmerpdf/fonts/OFL.txt`); the Khmer OS fonts are
 LGPL-2.1 (`khmerpdf/fonts/khmeros/COPYRIGHT-KhmerOS.txt`).
 The legacy font tables in `khmerpdf/legacy_tables.py` are derived from khmerconverter's `fontdata.xml`
