@@ -92,6 +92,13 @@ jobs:
             dist/KhmerPDF-*-linux-x86_64.tar.gz
             dist/khmerpdf_*_amd64.deb
 
+      # The app's updater checks the downloaded AppImage or .deb against this before installing it
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum KhmerPDF-*.AppImage KhmerPDF-*-linux-x86_64.tar.gz khmerpdf_*_amd64.deb > SHA256SUMS-linux.txt
+          cat SHA256SUMS-linux.txt
+
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
@@ -100,3 +107,4 @@ jobs:
             dist/KhmerPDF-*.AppImage
             dist/KhmerPDF-*-linux-x86_64.tar.gz
             dist/khmerpdf_*_amd64.deb
+            dist/SHA256SUMS-linux.txt

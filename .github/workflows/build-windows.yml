@@ -78,8 +78,19 @@ jobs:
           retention-days: 3
           path: dist/KhmerPDF-Setup-*.exe
 
+      # The app's updater checks the downloaded installer against this before running it
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem dist\KhmerPDF-Setup-*.exe | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+            Set-Content -Encoding ascii dist\SHA256SUMS-windows.txt
+          Get-Content dist\SHA256SUMS-windows.txt
+
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
-          files: dist/KhmerPDF-Setup-*.exe
+          files: |
+            dist/KhmerPDF-Setup-*.exe
+            dist/SHA256SUMS-windows.txt

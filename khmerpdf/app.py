@@ -4,12 +4,15 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pymupdf
-from PySide6.QtCore import QEvent, QEventLoop, QPoint, QPointF, QRect, QRectF, QSettings, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QFontDatabase, QFontMetricsF,
+from PySide6.QtCore import (QEvent, QEventLoop, QObject, QPoint, QPointF, QRect, QRectF, QSettings, QSize, Qt, QTimer,
+                            QUrl, Signal)
+from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontDatabase, QFontMetricsF,
                            QGuiApplication, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QTransform)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QColorDialog, QComboBox, QDialog,
                                QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
@@ -18,7 +21,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QColorDialog, QC
                                QSpinBox, QStackedWidget, QStyle, QStyledItemDelegate, QStyleFactory,
                                QTabBar, QToolBar, QToolButton, QVBoxLayout, QWidget)
 
-from . import __version__, ocr
+from . import __version__, ocr, updater
 from . import annots as AN
 from . import forms as F
 from . import pages as P
@@ -787,6 +790,13 @@ class SignatureDialog(QDialog):
 # --------------------------------------------------------------------------
 # Main window
 # --------------------------------------------------------------------------
+class _UpdateBridge(QObject):
+    """Carries update results from the background thread to the window."""
+    checked = Signal(object, object, bool)   # Release | None, error | None, quiet
+    progress = Signal(int, int)              # bytes done, total
+    prepared = Signal(object, object)        # (release, kind, file) | None, error | None
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -897,6 +907,13 @@ class MainWindow(QMainWindow):
         except AttributeError:
             pass
         self._doc_controls(False)
+        self._updates = _UpdateBridge()
+        self._updates.checked.connect(self._update_checked)
+        self._updates.progress.connect(self._update_progress)
+        self._updates.prepared.connect(self._update_prepared)
+        self._update_box: QProgressDialog | None = None
+        self._update_cancel = False
+        QTimer.singleShot(8000, self._auto_check_updates)   # after the window is up, in the background
 
     # ---- UI -------------------------------------------------------------
     def _act(self, text, slot, icon=None, shortcut=None, tip=None, tb=None, checkable=False):
@@ -1115,6 +1132,10 @@ class MainWindow(QMainWindow):
             a("Delete Page…", self.delete_pages, None, None, "Remove the selected pages"),
         ]
         self.about_act = a("About KhmerPDF Editor", self.about)
+        self.update_act = a("Check for Updates…", lambda: self.check_updates(quiet=False))
+        self.auto_update_act = a("Check for Updates Automatically", lambda on: self.settings.setValue("update/auto", on),
+                                 checkable=True)
+        self.auto_update_act.setChecked(self.settings.value("update/auto", True, type=bool))
         self.quit_act = a("Quit", self.close, None, QKeySequence.Quit)
         self.close_tab_act = a("Close", lambda: self.close_tab(self.tab_bar.currentIndex()), None,
                                QKeySequence.Close, "Close this document")
@@ -1149,7 +1170,7 @@ class MainWindow(QMainWindow):
         self.pages_menu = menu("&Pages", self.page_acts)
         menu("&Tools", [*self.mode_actions.values(), None, self.sign_act, self.insert_zwsp_act, None,
                         self.ocr_act, self.ocr_all_act, self.limon_act])
-        menu("&Help", [self.about_act])
+        menu("&Help", [self.update_act, self.auto_update_act, None, self.about_act])
 
     def _fill_recent_menu(self):
         self.recent_menu.clear()
@@ -1164,7 +1185,104 @@ class MainWindow(QMainWindow):
                           "shaping, searchable text, recovery of broken Khmer PDFs, legacy font (Limon, ABC) conversion and OCR."
                           "<br><br>Footprints International School<br><br>"
                           "<small>Built with PyMuPDF (AGPL), Qt for Python, HarfBuzz and Tesseract OCR. "
-                          "Fonts: Khmer OS (LGPL), Battambang and Moul (OFL).</small>")
+                          "Fonts: Khmer OS (LGPL), Battambang and Moul (OFL).<br>"
+                          f"Free software under the GNU AGPL-3.0. Source code: "
+                          f"<a href='https://github.com/{updater.REPO}'>github.com/{updater.REPO}</a></small>")
+
+    # ---- updates (GitHub Releases) ------------------------------------------
+    def _auto_check_updates(self):
+        """At most once a day, if the user hasn't turned it off. Says nothing unless there's a new version."""
+        if self.auto_update_act.isChecked() and time.time() - float(self.settings.value("update/last_check", 0) or 0) >= 86400:
+            self.check_updates(quiet=True)
+
+    def check_updates(self, quiet: bool = False):
+        self.settings.setValue("update/last_check", time.time())
+
+        def work():
+            try:
+                self._updates.checked.emit(updater.fetch_latest(), None, quiet)
+            except updater.UpdateError as ex:
+                self._updates.checked.emit(None, str(ex), quiet)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_checked(self, release, error, quiet):
+        if error:
+            if not quiet:
+                QMessageBox.warning(self, "Check for Updates", error)
+            return
+        if not release.version or not updater.is_newer(release.version):
+            if not quiet:
+                QMessageBox.information(self, "Check for Updates", f"You have the latest version ({__version__}).")
+            return
+        if quiet and self.settings.value("update/skip") == release.version:
+            return
+        kind = updater.install_kind()
+        box = QMessageBox(self)
+        box.setWindowTitle("Update Available")
+        box.setIcon(QMessageBox.Information)
+        box.setText(f"<b>{APP_NAME} {release.version}</b> is available. You have {__version__}.")
+        box.setInformativeText("Update Now downloads it, checks it and installs it. The app closes (it asks about unsaved "
+                               "changes first) and opens again." if kind else
+                               "This copy can't update itself: download the new version from the release page.")
+        if release.notes:
+            box.setDetailedText(release.notes)
+        now = box.addButton("Update Now" if kind else "Open Download Page", QMessageBox.AcceptRole)
+        skip = box.addButton("Skip This Version", QMessageBox.ActionRole)
+        box.addButton("Later", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is skip:
+            self.settings.setValue("update/skip", release.version)
+        elif box.clickedButton() is now:
+            if kind:
+                self._start_update(release, kind)
+            else:
+                QDesktopServices.openUrl(QUrl(release.page))
+
+    def _start_update(self, release, kind):
+        self._update_cancel = False
+        self._update_box = QProgressDialog(f"Downloading {APP_NAME} {release.version}…", "Cancel", 0, 0, self)
+        self._update_box.setWindowTitle("Update")
+        self._update_box.setWindowModality(Qt.WindowModal)
+        self._update_box.setMinimumDuration(0)
+        self._update_box.canceled.connect(lambda: setattr(self, "_update_cancel", True))
+        self._update_box.show()
+
+        def progress(done, total):
+            self._updates.progress.emit(done, total)
+            return not self._update_cancel
+
+        def work():
+            try:
+                self._updates.prepared.emit((release, kind, updater.prepare(release, kind, progress)), None)
+            except updater.UpdateError as ex:
+                self._updates.prepared.emit(None, str(ex))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_progress(self, done, total):
+        if self._update_box and total:
+            self._update_box.setMaximum(100)
+            self._update_box.setValue(int(done * 100 / total))
+            self._update_box.setLabelText(f"Downloading… {done / 1048576:.0f} of {total / 1048576:.0f} MB")
+
+    def _update_prepared(self, result, error):
+        if self._update_box:
+            self._update_box.close()
+            self._update_box = None
+        if error:
+            if not self._update_cancel:
+                QMessageBox.warning(self, "Update", error)
+            return
+        release, kind, file = result
+        # Closing asks about each changed document; cancelling there stops the update
+        if not self.close():
+            if kind == "appimage":
+                Path(file).unlink(missing_ok=True)
+            return
+        try:
+            updater.install(kind, Path(file))
+        except updater.UpdateError as ex:
+            QMessageBox.warning(None, "Update", str(ex))
+        QApplication.quit()
 
     # ---- pages ------------------------------------------------------------
     def _selected_pages(self) -> list[int]:
