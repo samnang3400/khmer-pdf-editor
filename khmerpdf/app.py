@@ -10,26 +10,30 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pymupdf
-from PySide6.QtCore import (QEvent, QEventLoop, QObject, QPoint, QPointF, QRect, QRectF, QSettings, QSize, Qt, QTimer,
+from PySide6.QtCore import (QEvent, QEventLoop, QItemSelectionModel, QObject, QPoint, QPointF, QRect, QRectF,
+                            QSettings, QSize, Qt, QTimer,
                             QUrl, Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontDatabase, QFontMetricsF,
-                           QGuiApplication, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QTransform)
+                           QGuiApplication, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QTextBlockFormat,
+                           QTextCharFormat, QTextCursor, QTextFormat, QTransform)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QColorDialog, QComboBox, QDialog,
                                QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-                               QPlainTextEdit, QProgressDialog, QPushButton, QScrollArea, QSizePolicy,
-                               QSpinBox, QStackedWidget, QStyle, QStyledItemDelegate, QStyleFactory,
+                               QPlainTextEdit, QProgressDialog, QPushButton, QScrollArea, QSizePolicy, QTextEdit,
+                               QSlider, QSpinBox, QStackedWidget, QStyle, QStyledItemDelegate, QStyleFactory,
                                QTabBar, QToolBar, QToolButton, QVBoxLayout, QWidget)
 
 from . import __version__, ocr, updater
 from . import annots as AN
+from . import marks as M
+from .styles import Style, merge as merge_runs, register as register_font
 from . import forms as F
 from . import pages as P
 from .annots import Annot
 from .recover import page_rules
 from . import theme as T
 from .engine import (Paragraph, Picture, TextLine, add_ocr_layer, bundled_fonts, convert_legacy,
-                     delete_paragraph, delete_picture, edit_text, insert_khmer_text, load_font, match_font,
+                     delete_paragraph, delete_picture, edit_text, insert_khmer_text, load_font, match_font, norm_font_name,
                      move_picture, paragraphs, pictures, replace_picture, search, system_khmer_fonts,
                      text_lines, write_paragraph)
 
@@ -68,6 +72,7 @@ class Fonts:
     def __init__(self):
         self.paths: dict[str, str] = {}
         self.families: dict[str, str] = {}
+        self.added: list[str] = []  # reference fonts found for a PDF since (for the font list)
         for name, path in bundled_fonts().items():
             self.add(name, path)
         for name, path in system_khmer_fonts().items():
@@ -80,7 +85,30 @@ class Fonts:
         fams = QFontDatabase.applicationFontFamilies(fid) if fid >= 0 else []
         self.paths[name] = path
         self.families[name] = fams[0] if fams else "Sans Serif"
+        register_font(name, path)
         return name
+
+    def name_of(self, family: str) -> str | None:
+        """The font name for a Qt font family (the editor's text formats)."""
+        return next((n for n, f in self.families.items() if f == family), None)
+
+    def find(self, pdf_font: str) -> str | None:
+        """The font to edit a PDF's font with: one already offered, else the
+        same font among those kept for reading PDFs (Google's Siemreap,
+        Kantumruy, Moul... in fonts/reference), which is then offered too."""
+        if not pdf_font:
+            return None
+        name = match_font(self.paths, pdf_font)
+        if name:
+            return name
+        from .recover import FONT_DIR as _FD
+        key = norm_font_name(pdf_font)
+        for p in sorted((_FD / "reference").glob("*.ttf")):
+            if norm_font_name(p.name) == key:
+                name = self.add(p.stem.replace("-", " "), str(p))
+                self.added.append(name)
+                return name
+        return None
 
     def qfont(self, name: str, px: float) -> QFont:
         f = QFont(self.families.get(name, "Sans Serif"))
@@ -91,26 +119,32 @@ class Fonts:
 # --------------------------------------------------------------------------
 # In-place text editor (sits on the page, over the text being edited)
 # --------------------------------------------------------------------------
-class InlineEditor(QPlainTextEdit):
-    """Enter = save, Shift+Enter = new line, Esc = cancel."""
+class InlineEditor(QTextEdit):
+    """Enter = save, Shift+Enter = new line, Esc = cancel, Ctrl+B / Ctrl+I =
+    bold / italic. Holds styled text: each piece keeps its font, weight,
+    slant and colour."""
     commit = Signal()
     cancel = Signal()
+    style_toggled = Signal()  # bold/italic changed with the keyboard
 
     def __init__(self, parent: QWidget, wrap_width: float | None):
         super().__init__(parent)
         self.wrap_width = wrap_width  # px; None = single line that grows to the right
         self.min_width = 60.0         # px; at least the width of the text being covered
         self.min_height = 0.0         # px; a form field's editor covers the whole field
+        self.line_px = 0.0            # px; fixed line height (the PDF's line spacing), 0 = the font's
+        self.setAcceptRichText(False)  # pasted text takes the style where it lands
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.setLineWrapMode(QPlainTextEdit.WidgetWidth if wrap_width else QPlainTextEdit.NoWrap)
+        self.setLineWrapMode(QTextEdit.WidgetWidth if wrap_width else QTextEdit.NoWrap)
         self.document().setDocumentMargin(1)
         self.textChanged.connect(self.fit)
 
     def event(self, e):
-        # keep Esc/Enter/Delete for us instead of the window's shortcuts
-        if e.type() == QEvent.ShortcutOverride and e.key() in (Qt.Key_Escape, Qt.Key_Return, Qt.Key_Enter,
-                                                                 Qt.Key_Delete, Qt.Key_Backspace):
+        # keep Esc/Enter/Delete and the style keys for us instead of the window's shortcuts
+        if e.type() == QEvent.ShortcutOverride and (
+                e.key() in (Qt.Key_Escape, Qt.Key_Return, Qt.Key_Enter, Qt.Key_Delete, Qt.Key_Backspace)
+                or e.modifiers() & Qt.ControlModifier and e.key() in (Qt.Key_B, Qt.Key_I)):
             e.accept()
             return True
         return super().event(e)
@@ -122,24 +156,111 @@ class InlineEditor(QPlainTextEdit):
         if e.key() in (Qt.Key_Return, Qt.Key_Enter) and not e.modifiers() & Qt.ShiftModifier:
             self.commit.emit()
             return
+        if e.modifiers() & Qt.ControlModifier and e.key() in (Qt.Key_B, Qt.Key_I):
+            self.toggle("bold" if e.key() == Qt.Key_B else "italic")
+            return
         super().keyPressEvent(e)
+
+    # ---- styles ------------------------------------------------------------
+    def toggle(self, what: str) -> None:
+        """Bold or italic on/off for the selection (or for what is typed next)."""
+        cur = self.textCursor()
+        fmt = cur.charFormat()
+        on = fmt.fontWeight() >= QFont.DemiBold if what == "bold" else fmt.fontItalic()
+        change = QTextCharFormat()
+        if what == "bold":
+            change.setFontWeight(QFont.Normal if on else QFont.Bold)
+        else:
+            change.setFontItalic(not on)
+        self.mergeCurrentCharFormat(change)
+        self.style_toggled.emit()
+
+    def set_runs(self, runs: list, family_of, px: float) -> None:
+        """Fill with styled text: runs of (text, Style) with resolved fonts and colours."""
+        self.clear()
+        cur = self.textCursor()
+        for text, st in runs:
+            fmt = QTextCharFormat()
+            fmt.setFontFamilies([family_of(st.font)])
+            f = QFont(family_of(st.font))
+            f.setPixelSize(max(round(px), 6))
+            f.setWeight(QFont.Bold if st.bold else QFont.Normal)
+            f.setItalic(st.italic)
+            fmt.setFont(f)
+            if st.color is not None:
+                fmt.setForeground(QColor.fromRgbF(*st.color))
+            parts = text.split("\n")
+            for i, part in enumerate(parts):
+                if i:
+                    cur.insertBlock()
+                cur.insertText(part, fmt)
+        self.setTextCursor(cur)
+        self.apply_line_height()
+
+    def runs(self, name_of, base_font: str, base_color: QColor) -> list:
+        """The text as runs of (text, Style); the paragraph's own font and
+        colour are left unnamed (Style.font "" / color None)."""
+        out = []
+        block = self.document().begin()
+        first = True
+        while block.isValid():
+            if not first:
+                out.append(("\n", out[-1][1] if out else Style()))
+            first = False
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid():
+                    fmt = frag.charFormat()
+                    fams = fmt.fontFamilies() or [fmt.font().family()]
+                    name = name_of(fams[0] if fams else "") or base_font
+                    col = fmt.foreground().color() if fmt.hasProperty(QTextFormat.ForegroundBrush) else base_color
+                    out.append((frag.text(), Style("" if name == base_font else name,
+                                                   fmt.fontWeight() >= QFont.DemiBold, fmt.fontItalic(),
+                                                   None if col.name() == base_color.name()
+                                                   else (col.redF(), col.greenF(), col.blueF()))))
+                it += 1
+            block = block.next()
+        return merge_runs([(t.replace("\u2029", "\n"), st) for t, st in out])
+
+    def restyle(self, change: QTextCharFormat, whole: bool) -> None:
+        """Apply a font/colour/size change to the selection, or to all the text."""
+        cur = self.textCursor()
+        if whole or not cur.hasSelection():
+            cur.select(QTextCursor.Document)
+            cur.mergeCharFormat(change)
+            self.mergeCurrentCharFormat(change)
+        else:
+            cur.mergeCharFormat(change)
+        self.apply_line_height()
+
+    def apply_line_height(self) -> None:
+        if not self.line_px:
+            return
+        cur = QTextCursor(self.document())
+        cur.select(QTextCursor.Document)
+        bf = QTextBlockFormat()
+        bf.setLineHeight(self.line_px, QTextBlockFormat.FixedHeight.value
+                         if hasattr(QTextBlockFormat.FixedHeight, "value") else 2)
+        self.blockSignals(True)
+        cur.mergeBlockFormat(bf)
+        self.blockSignals(False)
+        self.fit()
 
     def fit(self):
         """Grow with the text so the editor never shows scrollbars."""
-        fm = QFontMetricsF(self.font())
         pad = 10
+        doc = self.document()
         if self.wrap_width:
-            # QPlainTextEdit's document height is measured in (wrapped) lines,
-            # laid out at the current width: set the width first
+            # the document is laid out at the current width: set the width first
             w = max(self.wrap_width + pad, self.min_width)
             if self.width() != int(w):
                 self.resize(int(w), self.height())
-            n = max(1, int(self.document().size().height()))
-            h = n * fm.lineSpacing() + pad
+            doc.setTextWidth(self.viewport().width())
         else:
-            lines = self.toPlainText().split("\n")
-            w = max(fm.horizontalAdvance(t) for t in lines) + fm.averageCharWidth() * 3 + pad
-            h = len(lines) * fm.lineSpacing() + pad
+            doc.setTextWidth(-1)
+            w = doc.idealWidth() + QFontMetricsF(self.currentFont()).averageCharWidth() * 3 + pad
+        h = doc.size().height() + pad
         self.resize(int(max(w, self.min_width)), int(max(h, self.min_height)))
 
 
@@ -346,7 +467,7 @@ class PageCanvas(QWidget):
             self.field_clicked.emit(self.field_at(pos))
         elif self.mode in ("add", "highlight"):
             self._drag = dict(kind=self.mode, start=pos, rect=QRectF(pos, QSize(0, 0)))
-        elif self.mode in ("note", "place"):
+        elif self.mode in ("note", "place", "tick"):
             self.point_clicked.emit(self._to_page(pos))
         elif self.mode == "edit":
             para = self.hit(pos)  # fresh hit-test: the page may have just changed
@@ -557,6 +678,228 @@ class ThumbDelegate(QStyledItemDelegate):
 # --------------------------------------------------------------------------
 # Welcome screen and info banner
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Organize Pages: every page as a big picture in a grid, to rearrange
+# --------------------------------------------------------------------------
+class PageGrid(QListWidget):
+    reordered = Signal()
+    open_page = Signal(int)
+    delete_pressed = Signal()
+
+    def __init__(self):
+        super().__init__(objectName="pageGrid")
+        self.setViewMode(QListWidget.ListMode)  # (IconMode moves items freely instead of reordering)
+        self.setFlow(QListWidget.LeftToRight)
+        self.setWrapping(True)
+        self.setResizeMode(QListWidget.Adjust)
+        self.setSpacing(8)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.setMouseTracking(True)
+        self.itemDoubleClicked.connect(lambda it: self.open_page.emit(self.row(it)))
+
+    def dropEvent(self, e):
+        super().dropEvent(e)
+        self.reordered.emit()
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.delete_pressed.emit()
+            return
+        if e.key() in (Qt.Key_Return, Qt.Key_Enter) and self.currentRow() >= 0:
+            self.open_page.emit(self.currentRow())
+            return
+        super().keyPressEvent(e)
+
+
+class PageGridDelegate(QStyledItemDelegate):
+    """A big page picture with its number under it."""
+
+    def __init__(self, org: "Organizer"):
+        super().__init__(org)
+        self.org = org
+
+    def paint(self, p: QPainter, opt, index):
+        t = self.org.win.theme
+        r = QRectF(opt.rect).adjusted(4, 4, -4, -4)
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        if opt.state & QStyle.State_Selected:
+            p.setBrush(QColor(t.accent_soft))
+            p.drawRoundedRect(r, 8, 8)
+        elif opt.state & QStyle.State_MouseOver:
+            p.setBrush(QColor(t.hover))
+            p.drawRoundedRect(r, 8, 8)
+        icon = index.data(Qt.DecorationRole)
+        if icon:
+            w = self.org.thumb_w
+            pm = icon.pixmap(QSize(w, w * 2))
+            size = pm.deviceIndependentSize()
+            x = r.center().x() - size.width() / 2
+            y = r.top() + 10 + (self.org.max_h - size.height()) / 2  # landscape pages sit in the middle
+            sel = bool(opt.state & QStyle.State_Selected)
+            p.setPen(QPen(QColor(t.accent if sel else t.border), 2 if sel else 1))
+            p.drawRect(QRectF(x - 0.5, y - 0.5, size.width() + 1, size.height() + 1))
+            p.drawPixmap(QPointF(x, y), pm)
+        p.setPen(QColor(t.muted))
+        p.drawText(QRectF(r.left(), r.bottom() - 24, r.width(), 20), Qt.AlignCenter, str(index.row() + 1))
+        p.restore()
+
+    def sizeHint(self, opt, index):
+        return QSize(self.org.thumb_w + 32, self.org.max_h + 54)
+
+
+class Organizer(QWidget):
+    """The Organize Pages view (like Acrobat's): drag pages to reorder them;
+    select several (Ctrl/Shift-click, Ctrl+A) to rotate, duplicate, extract or
+    delete them; insert blank pages or another PDF after the selection.
+    Every change is a normal page operation of the window, so Ctrl+Z undoes it."""
+
+    def __init__(self, win: "MainWindow"):
+        super().__init__(objectName="organizer")
+        self.win = win
+        self.thumb_w = 170
+        self.max_h = 240
+        self._queue: list[int] = []
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        bar = QWidget(objectName="organizerBar")
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(12, 8, 12, 8)
+        title = QLabel("Organize Pages", objectName="title")
+        bl.addWidget(title)
+        bl.addSpacing(12)
+
+        def button(text, slot, tip):
+            b = QToolButton(text=text, autoRaise=True)
+            b.setToolTip(tip)
+            b.clicked.connect(slot)
+            bl.addWidget(b)
+            return b
+        w = win
+        button("Insert Blank", lambda: self._after_selection(w.insert_blank_page), "Add an empty page after the selected page")
+        button("Insert from PDF…", lambda: self._after_selection(w.insert_from_pdf),
+               "Add the pages of another PDF after the selected page")
+        button("Duplicate", w.duplicate_pages, "Copy the selected pages")
+        button("Rotate Left", lambda: w.rotate_pages(-90), "Turn the selected pages left")
+        button("Rotate Right", lambda: w.rotate_pages(90), "Turn the selected pages right")
+        button("Extract…", w.extract_pages, "Save the selected pages as a new PDF")
+        button("Delete", w.delete_pages, "Remove the selected pages (Delete key)")
+        bl.addStretch(1)
+        bl.addWidget(QLabel("Size", objectName="muted"))
+        self.zoom = QSlider(Qt.Horizontal)
+        self.zoom.setRange(90, 400)
+        self.zoom.setValue(self.thumb_w)
+        self.zoom.setFixedWidth(140)
+        self.zoom.valueChanged.connect(self._zoomed)
+        bl.addWidget(self.zoom)
+        bl.addSpacing(12)
+        done = QPushButton("Done", objectName="primary")
+        done.setToolTip("Back to the page view (Esc)")
+        done.clicked.connect(lambda: w.organize(False))
+        bl.addWidget(done)
+        lay.addWidget(bar)
+        self.hint = QLabel("Drag pages to put them in a new order. Ctrl/Shift-click to pick several. "
+                           "Double-click a page to open it.", objectName="hint")
+        self.hint.setContentsMargins(14, 4, 14, 4)
+        lay.addWidget(self.hint)
+        self.grid = PageGrid()
+        self.grid.setItemDelegate(PageGridDelegate(self))
+        self.grid.reordered.connect(self._reordered)
+        self.grid.open_page.connect(lambda n: w.organize(False, n))
+        self.grid.delete_pressed.connect(w.delete_pages)
+        lay.addWidget(self.grid, 1)
+        self._timer = QTimer(self, interval=0)
+        self._timer.timeout.connect(self._render_one)
+
+    def selected(self) -> list[int]:
+        return sorted(i.row() for i in self.grid.selectedIndexes())
+
+    def thumb_h(self, n: int) -> float:
+        doc = self.win.doc
+        if not doc or n >= doc.page_count:
+            return self.thumb_w * 1.42
+        r = doc[n].rect
+        return self.thumb_w * r.height / r.width
+
+    def _after_selection(self, op):
+        sel = self.selected()
+        if sel:
+            self.win.page_no = sel[-1]
+        op()
+
+    def rebuild(self, select: list[int] | None = None):
+        doc = self.win.doc
+        self.grid.clear()
+        if not doc:
+            return
+        self.max_h = int(max((self.thumb_h(i) for i in range(doc.page_count)), default=self.thumb_w * 1.42))
+        for i in range(doc.page_count):
+            it = QListWidgetItem()
+            it.setData(Qt.UserRole, i)
+            r = doc[i].rect
+            pm = QPixmap(max(int(self.thumb_w), 1), max(int(self.thumb_w * r.height / r.width), 1))
+            pm.fill(QColor("white"))
+            it.setIcon(QIcon(pm))
+            self.grid.addItem(it)
+        for n in select or [self.win.page_no]:
+            if 0 <= n < self.grid.count():
+                self.grid.item(n).setSelected(True)
+        if select or self.win.page_no < self.grid.count():
+            self.grid.setCurrentRow((select or [self.win.page_no])[0], QItemSelectionModel.NoUpdate)
+            self.grid.scrollToItem(self.grid.currentItem())
+        self._queue = list(range(doc.page_count))
+        self._timer.start()
+
+    def refresh(self, n: int):
+        if n not in self._queue:
+            self._queue.insert(0, n)
+        self._timer.start()
+
+    def _zoomed(self, v: int):
+        self.thumb_w = v
+        sel = self.selected()
+        self.rebuild(sel or None)
+
+    def _render_one(self):
+        doc = self.win.doc
+        if not doc or not self._queue or not self.isVisible():
+            self._timer.stop()
+            return
+        view = self.grid.viewport().rect()
+        n = next((n for n in self._queue if n < self.grid.count()
+                  and self.grid.visualItemRect(self.grid.item(n)).intersects(view)), self._queue[0])
+        self._queue.remove(n)
+        if n < doc.page_count and n < self.grid.count():
+            page = doc[n]
+            dpr = self.devicePixelRatioF()
+            z = self.thumb_w * dpr / page.rect.width
+            pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z), alpha=False)
+            img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()
+            pm = QPixmap.fromImage(img)
+            pm.setDevicePixelRatio(dpr)
+            ic = QIcon(pm)
+            ic.addPixmap(pm, QIcon.Selected)
+            self.grid.item(n).setIcon(ic)
+
+    def _reordered(self):
+        order = [self.grid.item(i).data(Qt.UserRole) for i in range(self.grid.count())]
+        if order == list(range(len(order))):
+            return
+        moved = sorted(order.index(n) for n in self.selected_pages_before) if self.selected_pages_before else []
+        self.win._page_op(lambda d: P.reorder(d, order), "Pages reordered", lambda _: moved or None)
+
+    @property
+    def selected_pages_before(self) -> list[int]:
+        return [self.grid.item(i).data(Qt.UserRole) for i in range(self.grid.count())
+                if self.grid.item(i).isSelected()]
+
+
+
 class Welcome(QWidget):
     open_clicked = Signal()
     recent_clicked = Signal(str)
@@ -836,7 +1179,8 @@ class MainWindow(QMainWindow):
         self.canvas.highlight_drawn.connect(self.add_highlight)
         self.canvas.point_clicked.connect(self._point_clicked)
         self.canvas.context_requested.connect(self._context_menu)
-        self._signature: bytes | None = None  # waiting to be placed
+        self._signature: bytes | None = None  # waiting to be placed (a signature or a picture)
+        self._place_kind = "signature"
 
         self.scroll = QScrollArea(objectName="pages")
         self.scroll.setWidget(PageFrame(self.canvas))
@@ -888,6 +1232,8 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget(objectName="central")
         self.stack.addWidget(self.welcome)
         self.stack.addWidget(doc_view)
+        self.organizer = Organizer(self)
+        self.stack.addWidget(self.organizer)
         self.setCentralWidget(self.stack)
 
         self._build_toolbar()
@@ -939,6 +1285,9 @@ class MainWindow(QMainWindow):
         self.sidebar_act = self._act("Pages", self._toggle_sidebar, "sidebar", "F4", "Show or hide the page list",
                                      tb, checkable=True)
         self.sidebar_act.setChecked(True)
+        self.organize_act = self._act("Organize Pages", lambda: self.organize(not self._organizing()), "pages",
+                                      "Ctrl+Shift+O", "See all the pages at once: drag to reorder, rotate, "
+                                      "delete, insert", tb)
         tb.addSeparator()
         self.open_act = self._act("Open…", self.open_dialog, "open", QKeySequence.Open, "Open a PDF", tb)
         self.save_act = self._act("Save", self.save, "save", QKeySequence.Save, "Save", None)
@@ -965,16 +1314,19 @@ class MainWindow(QMainWindow):
                 ("edit", "Edit Text", "edit", "E", "Click a paragraph or line to edit it in place"),
                 ("add", "Add Text", "add", "T", "Drag a box (or click) to add Khmer text"),
                 ("highlight", "Highlight", "highlight", "H", "Drag over text to highlight it"),
-                ("note", "Note", "note", "N", "Click to add a comment note")):
+                ("note", "Note", "note", "N", "Click to add a comment note"),
+                ("tick", "Tick", "check", "K", "Click a checkbox to tick it; click again to clear it")):
             a = self._act(label, lambda _=False, m=mode: self.set_mode(m), icon, key, tip, tb, checkable=True)
             group.addAction(a)
             self.mode_actions[mode] = a
             btn = tb.widgetForAction(a)
-            if mode not in ("highlight", "note"):  # (icons only: the toolbar is full)
+            if mode not in ("highlight", "note", "tick"):  # (icons only: the toolbar is full)
                 btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.mode_actions["view"].setChecked(True)
         self.sign_act = self._act("Sign…", self.sign, "sign", "Ctrl+Shift+S",
                                   "Place your signature (draw it once, or use a picture of it)", tb)
+        self.insert_pic_act = self._act("Insert Picture…", self.insert_picture, "image", "Ctrl+Shift+I",
+                                        "Put a picture on the page: pick the file, then click where it goes", tb)
         self.delete_act = self._act("Delete", self.delete_selection, "delete", QKeySequence.Delete,
                                     "Delete the selected text", tb)
         self.delete_act.setEnabled(False)
@@ -1045,6 +1397,20 @@ class MainWindow(QMainWindow):
         self.color_btn.setCursor(Qt.PointingHandCursor)
         self.color_btn.clicked.connect(self._pick_color)
         fb.addWidget(self.color_btn)
+        self.bold_act = QAction("B", self, checkable=True)
+        self.bold_act.setToolTip("Bold (Ctrl+B while typing)")
+        self.bold_act.triggered.connect(lambda: self._toggle_style("bold"))
+        self.italic_act = QAction("I", self, checkable=True)
+        self.italic_act.setToolTip("Italic (Ctrl+I while typing)")
+        self.italic_act.triggered.connect(lambda: self._toggle_style("italic"))
+        for act, bold in ((self.bold_act, True), (self.italic_act, False)):
+            fb.addAction(act)
+            btn = fb.widgetForAction(act)
+            f = QFont(btn.font())
+            f.setBold(bold)
+            f.setItalic(not bold)
+            btn.setFont(f)
+            act.setEnabled(False)
         fb.addSeparator()
         self.insert_zwsp_act = self._act("Word Break", self.insert_zwsp, "wordbreak", "Ctrl+Shift+Space",
                                          "Insert an invisible Khmer word break (ZWSP) where a line may wrap", fb)
@@ -1167,7 +1533,9 @@ class MainWindow(QMainWindow):
         menu("&Edit", [self.undo_act, self.redo_act, None, self.find_act, self.delete_act, self.replace_img_act])
         menu("&View", [self.sidebar_act, None, self.zoom_in_act, self.zoom_out_act, self.zoom_100_act,
                        self.fit_act, None, self.next_tab_act, self.prev_tab_act])
-        self.pages_menu = menu("&Pages", self.page_acts)
+        self.pages_menu = menu("&Pages", [self.organize_act, None, *self.page_acts])
+        menu("&Insert", [self.mode_actions["add"], self.insert_pic_act, self.sign_act, self.mode_actions["tick"],
+                         self.mode_actions["note"]])
         menu("&Tools", [*self.mode_actions.values(), None, self.sign_act, self.insert_zwsp_act, None,
                         self.ocr_act, self.ocr_all_act, self.limon_act])
         menu("&Help", [self.update_act, self.auto_update_act, None, self.about_act])
@@ -1287,8 +1655,29 @@ class MainWindow(QMainWindow):
     # ---- pages ------------------------------------------------------------
     def _selected_pages(self) -> list[int]:
         """The pages picked in the page list (Ctrl/Shift-click), else this page."""
+        if self._organizing():
+            return self.organizer.selected() or [self.page_no]
         rows = sorted(i.row() for i in self.thumbs.selectedIndexes())
         return rows if len(rows) > 1 else [self.page_no]
+
+    def _organizing(self) -> bool:
+        return self.stack.currentWidget() is getattr(self, "organizer", None)
+
+    def organize(self, on: bool, page: int | None = None):
+        """Open (or leave) the Organize Pages view; leaving it on `page` shows that page."""
+        if not self.doc:
+            return
+        self._close_inline(save=True)
+        if on:
+            self.stack.setCurrentWidget(self.organizer)
+            self.organizer.rebuild()
+            self.organizer.grid.setFocus()
+            return
+        if page is not None:
+            self.page_no = page
+        self.stack.setCurrentIndex(1)
+        self._rebuild_thumbs()
+        self.render()
 
     def _pages_changed(self, select: list[int] | None = None):
         """After pages were added, removed or moved."""
@@ -1305,6 +1694,8 @@ class MainWindow(QMainWindow):
         if select and len(select) > 1:
             for r in select:
                 self.thumbs.item(r).setSelected(True)
+        if self._organizing():
+            self.organizer.rebuild(select)
         self.render()
         self._refresh_undo_actions()
 
@@ -1513,13 +1904,14 @@ class MainWindow(QMainWindow):
     def _doc_controls(self, on: bool):
         for a in (self.save_act, self.save_as_act, self.close_tab_act, self.next_tab_act, self.prev_tab_act,
                   self.ocr_act, self.ocr_all_act, self.limon_act,
-                  self.print_act, self.preview_act, self.sign_act, *self.mode_actions.values(),
+                  self.print_act, self.preview_act, self.sign_act, self.insert_pic_act, self.organize_act,
+                  *self.mode_actions.values(),
                   *[x for x in getattr(self, "page_acts", []) if x]):
             a.setEnabled(on)
         for w in self._nav + self._nav_gaps:
             w.setVisible(on)
         self.find_box.setEnabled(on)
-        self.stack.setCurrentIndex(1 if on else 0)
+        self.stack.setCurrentIndex(1 if on else 0)  # (also leaves Organize Pages)
 
     def _toggle_sidebar(self):
         self.thumbs.setVisible(self.sidebar_act.isChecked())
@@ -1534,18 +1926,18 @@ class MainWindow(QMainWindow):
         if c.isValid():
             self.cur_color = c
             self._paint_color_btn()
-            self._style_inline()
+            self._style_inline("color")
         if self.inline:
             self.inline["editor"].setFocus()
 
     def _size_changed(self, v: float):
         self.cur_size = v
-        self._style_inline()
+        self._style_inline("size")
 
     def _font_changed(self, name: str):
         if name != "Add font file…":
             self.cur_font = name
-            self._style_inline()
+            self._style_inline("font")
             return
         path, _ = QFileDialog.getOpenFileName(self, "Add a Khmer font", "", "Fonts (*.ttf *.otf)")
         self.font_box.blockSignals(True)
@@ -1559,12 +1951,13 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, APP_NAME, f"Could not load font:\n{exc}")
         self.font_box.setCurrentText(self.cur_font)
         self.font_box.blockSignals(False)
-        self._style_inline()
+        self._style_inline("font")
 
     HINTS = {"view": "", "select": "Drag to move · handles resize · Delete removes · double-click edits",
              "edit": "Click text to edit it in place", "add": "Drag a box (or click) and type",
              "highlight": "Drag over text (or click a line) to highlight it", "note": "Click where the note goes",
-             "place": "Click where your signature goes · Esc cancels"}
+             "place": "Click where your signature goes · Esc cancels",
+             "tick": "Click a checkbox to tick it · click again to clear it"}
 
     def set_mode(self, mode: str):
         self._close_inline(save=True)
@@ -1576,7 +1969,8 @@ class MainWindow(QMainWindow):
         if mode != "select" and self.canvas.selected:
             self.canvas.selected = None
             self._selection_changed(None)
-        self.canvas.setCursor(Qt.CrossCursor if mode in ("add", "highlight", "note", "place") else Qt.ArrowCursor)
+        self.canvas.setCursor(Qt.CrossCursor if mode in ("add", "highlight", "note", "place", "tick")
+                              else Qt.ArrowCursor)
         self.tool_hint.setText(self.HINTS[mode])
         hints = {"view": "", "select": "Click text to select it. Drag it to move it; drag a side handle to change "
                                        "its width, a corner to make it bigger or smaller.",
@@ -1585,7 +1979,12 @@ class MainWindow(QMainWindow):
                  "highlight": "Drag over the text to highlight, or click a line. Right-click a highlight to "
                               "remove it.",
                  "note": "Click where the note should go, then type your comment.",
-                 "place": "Click on the page where your signature should go (Esc cancels)."}
+                 "place": "Click on the page where your signature should go (Esc cancels).",
+                 "tick": "Click a checkbox to tick it, and again to clear it. Clicking where there is no box "
+                         "puts a tick there."}
+        if mode == "place" and self._place_kind == "picture":
+            self.tool_hint.setText("Click where the picture goes · Esc cancels")
+            hints["place"] = "Click on the page where the picture should go (Esc cancels)."
         self.statusBar().showMessage(hints[mode])
         self.canvas.update()
 
@@ -1693,6 +2092,8 @@ class MainWindow(QMainWindow):
             setattr(self, k, st[k])
         self._tab_id = tid
         self._show_doc(st)
+        if self._organizing():
+            self.organizer.rebuild()
 
     def _tab_close_button(self) -> QToolButton:
         b = QToolButton(autoRaise=True, objectName="tabClose")
@@ -1843,6 +2244,11 @@ class MainWindow(QMainWindow):
         self._thumb_timer.start()
 
     def _refresh_thumb(self, n: int):
+        if self._organizing():
+            if self.organizer.grid.count() != self.doc.page_count:
+                self.organizer.rebuild()
+            else:
+                self.organizer.refresh(n)
         if n not in self._thumb_queue:
             self._thumb_queue.insert(0, n)
         self._thumb_timer.start()
@@ -1915,8 +2321,17 @@ class MainWindow(QMainWindow):
             return "annot", item.rect.x0, item.rect.y0
         return "text", item.x, item.first.baseline
 
+    def _find_font(self, pdf_font: str) -> str | None:
+        """Fonts.find, adding a newly found font to the toolbar's list."""
+        name = self.fonts.find(pdf_font)
+        while self.fonts.added:
+            self.font_box.blockSignals(True)
+            self.font_box.insertItem(self.font_box.count() - 1, self.fonts.added.pop(0))
+            self.font_box.blockSignals(False)
+        return name
+
     def _font_for(self, pdf_font: str) -> str:
-        return match_font(self.fonts.paths, pdf_font) or self.cur_font
+        return self._find_font(pdf_font) or self.cur_font
 
     def _selection_changed(self, para):
         self.delete_act.setEnabled(para is not None and self.canvas.mode == "select")
@@ -1954,7 +2369,7 @@ class MainWindow(QMainWindow):
         first, scale = para.first, kw.get("scale", 1.0)
         self._select_key = ("text", para.x + kw.get("dx", 0.0), first.baseline + kw.get("dy", 0.0))
         self._changed()
-        if not match_font(self.fonts.paths, first.font) and not first.xref:
+        if not self._find_font(first.font) and not first.xref:
             self.statusBar().showMessage(f"The PDF's font “{first.font}” isn't available, so the text was "
                                          f"redrawn in {name}.")
         elif scale != 1.0:
@@ -2104,11 +2519,44 @@ class MainWindow(QMainWindow):
         elif self.canvas.mode == "place" and self._signature:
             png, self._signature = self._signature, None
             self._snapshot()
-            r = AN.place_signature(self.doc[self.page_no], png, pt)
+            picture = self._place_kind == "picture"
+            try:
+                r = (M.place_picture if picture else AN.place_signature)(self.doc[self.page_no], png, pt)
+            except Exception as exc:
+                self._restore(self.undo_stack.pop())
+                QMessageBox.warning(self, APP_NAME, f"Could not place the picture:\n{exc}")
+                return
             self.set_mode("select")
             self._select_key = ("pic", r.x0, r.y0)
             self._changed()
-            self.statusBar().showMessage("Signature placed: drag it to move, corners resize, Delete removes", 6000)
+            self.statusBar().showMessage(f"{'Picture' if picture else 'Signature'} placed: drag it to move, "
+                                         "corners resize, Delete removes", 6000)
+        elif self.canvas.mode == "tick":
+            self._snapshot()
+            c = self.cur_color
+            what, _ = M.toggle_tick(self.doc[self.page_no], pt, (c.redF(), c.greenF(), c.blueF()))
+            self._changed()
+            self.statusBar().showMessage({"ticked": "Ticked (click again to clear it)",
+                                          "cleared": "Tick cleared",
+                                          "placed": "No checkbox there: placed a tick (Ctrl+Z to undo)"}[what],
+                                         4000)
+
+    def insert_picture(self):
+        if not self.doc:
+            return
+        self._close_inline(save=True)
+        start = str(Path(self.path).parent) if self.path else ""
+        path, _ = QFileDialog.getOpenFileName(self, "Insert picture", start, IMAGE_FILES)
+        if not path:
+            return
+        try:
+            data = Path(path).read_bytes()
+            pymupdf.Pixmap(data)  # can it be read at all?
+        except Exception as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not read the picture:\n{exc}")
+            return
+        self._signature, self._place_kind = data, "picture"
+        self.set_mode("place")
 
     def edit_note(self, item: Annot):
         if not item.movable:
@@ -2124,10 +2572,13 @@ class MainWindow(QMainWindow):
         dlg = SignatureDialog(self)
         if dlg.exec() != QDialog.Accepted or not dlg.result_png:
             return
-        self._signature = dlg.result_png
+        self._signature, self._place_kind = dlg.result_png, "signature"
         self.set_mode("place")
 
     def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape and self._organizing():
+            self.organize(False)
+            return
         if e.key() == Qt.Key_Escape and self.canvas.mode == "place":
             self.set_mode("view")
             return
@@ -2230,7 +2681,7 @@ class MainWindow(QMainWindow):
         if len(para.lines) == 1:
             self.edit_line(para.first)
             return
-        font = match_font(self.fonts.paths, para.first.font)
+        font = self._find_font(para.first.font)
         self._edit_message(para, font)
         if not font:
             font = self.cur_font
@@ -2238,20 +2689,20 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"The PDF's font “{para.first.font}” isn't available; using {font}. "
                                              "Pick another font in the toolbar if you like.")
         self._open_inline("para", para, block_rect(para), para.text, font, para.first.size,
-                          QColor.fromRgbF(*para.first.color), wrap=True)
+                          QColor.fromRgbF(*para.first.color), wrap=True, runs=para.runs)
 
     def edit_line(self, line: TextLine):
-        font = match_font(self.fonts.paths, line.font)
+        font = self._find_font(line.font)
         self._edit_message(line, font or line.font)
         if not font:
             font = self.cur_font
             if line.font and not (line.needs_check or line.garbled or line.legacy):
                 self.statusBar().showMessage(f"The PDF's font “{line.font}” isn't available; using {font}. "
                                              "Pick another font in the toolbar if you like.")
-        self._open_inline("edit", line, line.rect, "" if line.garbled else line.text,
-                          font, line.size, QColor.fromRgbF(*line.color), wrap=False)
+        self._open_inline("edit", line, line.rect, "" if line.garbled else line.text, font, line.size,
+                          QColor.fromRgbF(*line.color), wrap=False, runs=[] if line.garbled else line.runs)
 
-    def _open_inline(self, kind, target, rect, text, font, size, color, wrap):
+    def _open_inline(self, kind, target, rect, text, font, size, color, wrap, runs=None):
         self._close_inline(save=True)
         if kind == "edit":
             target = next((ln for ln in self.canvas.lines if ln.rect == target.rect), target)
@@ -2276,15 +2727,23 @@ class MainWindow(QMainWindow):
             ed.min_height = rect.height * s + 10
         garbled = kind == "edit" and target.garbled
         ed.setPlaceholderText("Type the replacement text…" if garbled else "Type here…")
-        ed.setPlainText(text)
+        if kind == "para" and target.step:
+            ed.line_px = target.step * s  # wrapped lines sit as far apart as in the PDF
         ed.commit.connect(lambda: self._close_inline(save=True))
         ed.cancel.connect(lambda: self._close_inline(save=False))
+        ed.style_toggled.connect(self._sync_style_buttons)
+        ed.cursorPositionChanged.connect(self._sync_style_buttons)
         grip = EditorGrip(self.canvas, ed)
         self.inline = dict(editor=ed, grip=grip, kind=kind, line=target if kind == "edit" else None,
                            para=target if kind == "para" else None, field=target if kind == "field" else None,
-                           rect=pymupdf.Rect(rect),
-                           start=(text, font, size, QColor(color).name()))
+                           rect=pymupdf.Rect(rect), orig_size=size)
         self._style_inline()
+        base = QColor(color)
+        resolved = [(t, Style(st.font or font, st.bold, st.italic,
+                              tuple(st.color) if st.color else (base.redF(), base.greenF(), base.blueF())))
+                    for t, st in (runs if runs and kind != "field" else [(text, Style())])]
+        ed.set_runs(resolved, self._family_of, size * s)
+        self.inline["start"] = (text, ed.runs(self.fonts.name_of, font, base), font, size, base.name())
         top = (target.baseline - size * 1.0) * s if kind == "edit" else rect.y0 * s + (5 if kind == "field" else 0)
         ed.move(int(rect.x0 * s) - 5, int(min(top, rect.y0 * s)) - 5)
         self.inline["origin"] = QPoint(ed.pos())
@@ -2297,15 +2756,37 @@ class MainWindow(QMainWindow):
         ed.moveCursor(ed.textCursor().MoveOperation.End)
         self.insert_zwsp_act.setEnabled(True)
 
-    def _style_inline(self):
+    def _family_of(self, name: str) -> str:
+        """Qt font family for a font name (a PDF's or the app's)."""
+        found = self._find_font(name) if name else None
+        return self.fonts.families.get(found or self.cur_font, "Sans Serif")
+
+    def _style_inline(self, change: str | None = None):
+        """Show the toolbar's style in the open editor. `change`: what the
+        user just changed - 'font' and 'color' apply to the selected text
+        (all of it when nothing is selected); 'size' to all of it."""
         if not self.inline:
             return
         ed = self.inline["editor"]
-        ed.setFont(self.fonts.qfont(self.cur_font, self.cur_size * self.canvas.scale))
+        px = self.cur_size * self.canvas.scale
+        ed.setFont(self.fonts.qfont(self.cur_font, px))
+        fmt = QTextCharFormat()
+        if change == "font":
+            fmt.setFontFamilies([self.fonts.families.get(self.cur_font, "Sans Serif")])
+            ed.restyle(fmt, whole=False)
+        elif change == "color":
+            fmt.setForeground(self.cur_color)
+            ed.restyle(fmt, whole=False)
+        elif change == "size":
+            fmt.setProperty(QTextFormat.FontPixelSize, max(round(px), 6))
+            para = self.inline.get("para")
+            if para is not None and para.step:
+                ed.line_px = para.step * self.canvas.scale * self.cur_size / self.inline["orig_size"]
+            ed.restyle(fmt, whole=True)
         target = self.inline.get("line") or self.inline.get("para")
         check = target is not None and (target.needs_check or target.garbled)
         border = self.theme.warning if check else self.theme.accent
-        ed.setStyleSheet(f"QPlainTextEdit {{ color: {self.cur_color.name()}; background: white; "
+        ed.setStyleSheet(f"QTextEdit {{ color: {self.cur_color.name()}; background: white; "
                          f"border: 2px solid {border}; border-radius: 4px; selection-background-color: "
                          f"{self.theme.accent}; selection-color: white; }}")
         ed.fit()
@@ -2314,6 +2795,27 @@ class MainWindow(QMainWindow):
                            f"padding: 2px 8px; border-radius: 4px; }}")
         grip.place()
 
+    def _toggle_style(self, what: str):
+        if self.inline and self.inline["kind"] != "field":
+            self.inline["editor"].toggle(what)
+            self.inline["editor"].setFocus()
+
+    def _sync_style_buttons(self):
+        ed = self.inline["editor"] if self.inline else None
+        on = ed is not None and self.inline["kind"] != "field"
+        fmt = None
+        if on:
+            cur = QTextCursor(ed.textCursor())
+            if cur.hasSelection():  # the selection's style, not the letter before it
+                cur.setPosition(cur.selectionEnd())
+            fmt = cur.charFormat() if cur.hasSelection() or cur.position() else ed.currentCharFormat()
+        for act, val in ((self.bold_act, on and fmt.fontWeight() >= QFont.DemiBold),
+                         (self.italic_act, on and fmt.fontItalic())):
+            act.blockSignals(True)
+            act.setEnabled(on)
+            act.setChecked(bool(val))
+            act.blockSignals(False)
+
     def _close_inline(self, save: bool) -> None:
         """Save (or discard) the open in-place editor, if any."""
         if not getattr(self, "inline", None):
@@ -2321,16 +2823,19 @@ class MainWindow(QMainWindow):
         st, self.inline = self.inline, None
         ed = st["editor"]
         text = ed.toPlainText()
+        runs = ed.runs(self.fonts.name_of, self.cur_font, self.cur_color)
         moved = ed.pos() - st.get("origin", ed.pos())
         dx, dy = moved.x() / self.canvas.scale, moved.y() / self.canvas.scale  # dragged by its grip
         for w in (ed, st["grip"]):
             w.hide()
             w.deleteLater()
         self.insert_zwsp_act.setEnabled(False)
+        self._sync_style_buttons()
         self.canvas.setFocus()
         if not save or not self.doc:
             return
-        unchanged = (text, self.cur_font, self.cur_size, self.cur_color.name()) == st["start"] and not (dx or dy)
+        unchanged = ((text, runs, self.cur_font, self.cur_size, self.cur_color.name()) == st["start"]
+                     and not (dx or dy))
         if st["kind"] == "add" and not text.strip():
             return
         if st["kind"] == "edit" and (unchanged or (st["line"].garbled and not text.strip())):
@@ -2359,13 +2864,14 @@ class MainWindow(QMainWindow):
             if st["kind"] == "add":
                 r = st["rect"]
                 insert_khmer_text(page, pymupdf.Rect(r.x0 + dx, r.y0 + dy, r.x1 + dx, r.y1 + dy), text,
-                                  font=font, size=self.cur_size, color=rgb)
+                                  font=font, size=self.cur_size, color=rgb, runs=runs)
             else:
                 # longer text pushes what's below it down (unless it was dragged elsewhere)
                 _, warning, made_room = edit_text(
                     page, st["line"] if st["kind"] == "edit" else st["para"], text, font=font,
-                    size=self.cur_size, color=rgb, fit=st["start"][1:3] == (self.cur_font, self.cur_size),
-                    dx=dx, dy=dy, font_for=lambda name: load_font(self.fonts.paths[self._font_for(name)]))
+                    size=self.cur_size, color=rgb, fit=st["start"][2:4] == (self.cur_font, self.cur_size),
+                    dx=dx, dy=dy, font_for=lambda name: load_font(self.fonts.paths[self._font_for(name)]),
+                    runs=runs)
         except Exception as exc:
             self._restore(self.undo_stack.pop())
             QMessageBox.critical(self, APP_NAME, f"Could not save the text:\n{exc}")

@@ -34,9 +34,19 @@ Lines written by the app also store their own text, font, size and colour, so ed
   editor's **Move** tab to put the text somewhere else. When the text grows (or you add lines), the
   paragraphs and pictures **below it move down to make room**, like in a word processor; tables and
   ruling lines stay put, and you're warned if there isn't room
+- **Bold, italic, fonts and colours are kept**: a line or paragraph that mixes styles (a bold name after a
+  plain label, a red date, a word in another font) is edited with those styles, shown in the edit box and
+  saved back. **Ctrl+B** / **Ctrl+I** (or the **B** / **I** buttons) make the selected text bold or
+  italic; the toolbar's font and colour apply to the selected text (all of it when nothing is selected).
+  Bold uses the font's bold version when there is one (Battambang Bold, Kantumruy Bold...), otherwise a
+  slightly thickened outline; Khmer fonts have no italic, so italic is a slanted copy. PDFs printed from
+  web pages often draw bold text as shapes with invisible text on top: that text reads as bold, and the
+  old shapes are removed when you edit it. Letters a font lacks (English in Siemreap or Moul) are drawn
+  in Khmer OS instead of as empty boxes
 - **Paragraphs**: lines that flow on (same font and size, regular spacing, aligned edges) are edited
   as one paragraph and re-wrapped inside its width; justified paragraphs stay justified. Text added
-  with the app keeps its exact paragraph
+  with the app keeps its exact paragraph. A line starting with a bullet or number (`-`, `•`, `1.`, `១.`,
+  `ក.`, `(a)`) starts a new item, and an item's next lines keep their hanging indent
 - **Select** (V): click text to select it, drag it to **move** it, drag a side handle to change its
   **width** (the text re-wraps), a corner to make it **bigger or smaller**, and press Delete to
   **delete** it. Double-click to edit
@@ -45,8 +55,16 @@ Lines written by the app also store their own text, font, size and colour, so ed
 - **Pages**: insert a blank page, insert the pages of another PDF (merge), extract pages to a new PDF
   (split), duplicate, delete, rotate and move pages; drag thumbnails to reorder them, Ctrl/Shift-click
   to work on several pages at once (Pages menu, or right-click the page list)
+- **Organize Pages** (Ctrl+Shift+O): every page as a large picture in a grid, like Acrobat's. Drag pages
+  into a new order; select several to rotate, duplicate, extract or delete them (Delete key); insert a
+  blank page or another PDF after the selection; the Size slider sets the picture size. Double-click a
+  page (or press Esc / Done) to go back. Ctrl+Z undoes each change
+- **Insert Picture** (Ctrl+Shift+I): pick a picture, click where it goes; then move and resize it like
+  any picture
 - **Fill in forms**: click a field to type (Khmer is shaped correctly in the saved PDF, which most
   PDF tools get wrong), tick checkboxes, pick from lists
+- **Tick** (K): click a checkbox drawn on the page (a printed form's square, or a ☐) to put a check mark
+  in it, sized to the box; click again to clear it. Clicking where there is no box puts a tick there
 - **Highlight** (H) text, add comment **notes** (N); right-click anything on the page for what you
   can do with it (edit or remove notes and highlights, replace pictures, page tools…)
 - **Sign**: draw your signature once (it's remembered) or use a picture of it, then click to place it;
@@ -152,8 +170,8 @@ sudo apt install tesseract-ocr patchelf libxcb-cursor0
 pip install -r requirements-dev.txt
 installer/linux/bundle-tesseract.sh          # optional, for OCR: copies tesseract into build-deps/
 pyinstaller --noconfirm khmerpdf.spec
-installer/linux/build-appimage.sh 0.6.0      # needs appimagetool on PATH (or APPIMAGETOOL=...)
-installer/linux/build-deb.sh 0.6.0
+installer/linux/build-appimage.sh 0.7.0      # needs appimagetool on PATH (or APPIMAGETOOL=...)
+installer/linux/build-deb.sh 0.7.0
 ```
 
 An AppImage only runs on systems with the same or newer glibc as the PC that built it, so build on
@@ -171,7 +189,9 @@ To add it to the app menu, use a tool such as Gear Lever or AppImageLauncher.
   may still join or split wrongly
 - Paragraph detection is deliberately cautious: lines in tables or columns stay separate lines
 - Moving or resizing text from another PDF redraws it; if its font isn't available it is drawn in
-  the toolbar's font. First-line indents are not kept when a paragraph re-wraps
+  the toolbar's font. First-line and hanging indents are kept when a paragraph re-wraps
+- Styles are kept per character, but the size is one per line or paragraph. Each style piece is shaped on
+  its own, so a style change in the middle of a Khmer syllable can't join up the way it would in one run
 - OCR quality depends on the scan (300 dpi works best); the bundled "fast" models favour speed
 - Exact recovery needs the same font the PDF used (bundled Khmer OS fonts, or one installed on the PC).
   Without it, the rule-based repair gets most syllables right but can't see letters hidden in ligatures

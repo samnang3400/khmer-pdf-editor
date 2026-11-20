@@ -315,7 +315,7 @@ def _page_labels(w):
 
 def test_menus_have_print_and_page_tools(pages_win):
     titles = [a.text().replace("&", "") for a in pages_win.menuBar().actions()]
-    assert titles == ["File", "Edit", "View", "Pages", "Tools", "Help"]
+    assert titles == ["File", "Edit", "View", "Pages", "Insert", "Tools", "Help"]
     file_menu = pages_win.menuBar().actions()[0].menu()
     assert "Print…" in [a.text() for a in file_menu.actions()]
     assert pages_win.print_act.shortcut() == QKeySequence(QKeySequence.Print)
@@ -503,3 +503,133 @@ def test_documents_open_in_tabs(pages_win, tmp_path, monkeypatch):
     assert w.tab_bar.count() == 1 and w.path == str(second)
     QTest.mouseClick(w.tab_bar.tabButton(0, A.QTabBar.RightSide), Qt.LeftButton)  # its × button
     assert w.tab_bar.count() == 0 and w.doc is None and w.stack.currentIndex() == 0
+
+
+# ---- 0.7.0: styled text, ticks, pictures, Organize Pages -----------------------
+@pytest.fixture
+def styled_win(qapp, tmp_path):
+    from khmerpdf.engine import insert_khmer_text
+    from khmerpdf.styles import Style
+    doc = pymupdf.open()
+    runs = [("ឈ្មោះ៖ ", Style()), ("សុខ សាន្ត", Style(bold=True))]
+    insert_khmer_text(doc.new_page(), pymupdf.Rect(60, 80, 500, 120), "ឈ្មោះ៖ សុខ សាន្ត", size=16,
+                      wrap_text=False, runs=runs)
+    fn = tmp_path / "styled.pdf"
+    doc.save(fn)
+    w = A.MainWindow()
+    w.resize(1000, 800)
+    w.show()
+    w.open_file(str(fn))
+    yield w
+    w.dirty = False
+    w.close()
+
+
+def _runs(w):
+    return [(t, s.bold, s.italic) for t, s in text_lines(w.doc[0])[0].runs]
+
+
+def test_edit_box_shows_bold_and_ctrl_i_makes_italic(styled_win):
+    from PySide6.QtGui import QTextCursor
+    w = styled_win
+    w.set_mode("edit")
+    _click_line(w, "ឈ្មោះ")
+    ed = w.inline["editor"]
+    cur = ed.textCursor()
+    cur.setPosition(len("ឈ្មោះ៖ សុ"))
+    ed.setTextCursor(cur)
+    assert w.bold_act.isChecked() and w.bold_act.isEnabled()       # the cursor is in the bold name
+    cur.setPosition(0)
+    cur.setPosition(len("ឈ្មោះ"), QTextCursor.KeepAnchor)
+    ed.setTextCursor(cur)
+    QTest.keyClick(ed, Qt.Key_I, Qt.ControlModifier)
+    assert w.italic_act.isChecked()
+    QTest.keyClick(ed, Qt.Key_Return)
+    QApplication.processEvents()
+    assert _runs(w) == [("ឈ្មោះ", False, True), ("៖ ", False, False), ("សុខ សាន្ត", True, False)]
+    assert w.undo_stack
+
+
+def test_unchanged_styled_text_is_not_rewritten(styled_win):
+    w = styled_win
+    w.set_mode("edit")
+    _click_line(w, "ឈ្មោះ")
+    QTest.keyClick(w.inline["editor"], Qt.Key_Return)
+    assert not w.undo_stack
+
+
+def test_toolbar_bold_applies_to_the_selection_only(styled_win):
+    from PySide6.QtGui import QTextCursor
+    w = styled_win
+    w.set_mode("edit")
+    _click_line(w, "ឈ្មោះ")
+    ed = w.inline["editor"]
+    cur = ed.textCursor()
+    cur.setPosition(0)
+    cur.setPosition(len("ឈ្មោះ"), QTextCursor.KeepAnchor)
+    ed.setTextCursor(cur)
+    w.bold_act.trigger()
+    w._close_inline(save=True)
+    assert _runs(w) == [("ឈ្មោះ", True, False), ("៖ ", False, False), ("សុខ សាន្ត", True, False)]
+
+
+def test_tick_tool_ticks_and_clears_a_drawn_box(qapp, tmp_path):
+    from khmerpdf import marks as M
+    doc = pymupdf.open()
+    doc.new_page().draw_rect(pymupdf.Rect(100, 100, 114, 114), color=(0, 0, 0), width=0.8)
+    fn = tmp_path / "box.pdf"
+    doc.save(fn)
+    w = A.MainWindow()
+    w.show()
+    w.open_file(str(fn))
+    w.set_mode("tick")
+    c = w.canvas
+    for _ in range(2):
+        QTest.mouseClick(c, Qt.LeftButton, pos=QPoint(int(107 * c.scale), int(107 * c.scale)))
+        QApplication.processEvents()
+    assert len(w.undo_stack) == 2 and not M.is_ticked(w.doc[0], pymupdf.Rect(100, 100, 114, 114))
+    w.undo()
+    assert M.is_ticked(w.doc[0], pymupdf.Rect(100, 100, 114, 114))
+    w.dirty = False
+    w.close()
+
+
+def test_insert_picture(win, tmp_path, monkeypatch):
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 120, 60), False)
+    pix.clear_with(90)
+    png = tmp_path / "logo.png"
+    png.write_bytes(pix.tobytes("png"))
+    monkeypatch.setattr(A.QFileDialog, "getOpenFileName", lambda *a, **k: (str(png), ""))
+    win.insert_picture()
+    assert win.canvas.mode == "place" and "picture" in win.tool_hint.text()
+    c = win.canvas
+    QTest.mouseClick(c, Qt.LeftButton, pos=QPoint(int(300 * c.scale), int(400 * c.scale)))
+    QApplication.processEvents()
+    assert len(win.doc[0].get_images()) == 1
+    assert win.canvas.mode == "select" and isinstance(win.canvas.selected, A.Picture)
+
+
+def test_organize_pages(pages_win, monkeypatch):
+    w = pages_win
+    w.organize_act.trigger()
+    assert w._organizing() and w.organizer.grid.count() == 4
+    g = w.organizer.grid
+    g.clearSelection()
+    g.item(1).setSelected(True)
+    g.item(2).setSelected(True)
+    w.rotate_pages(90)
+    assert [p.rotation for p in w.doc] == [0, 90, 90, 0]
+    g.clearSelection()
+    it = g.takeItem(3)                                   # drag the last page to the front
+    g.insertItem(0, it)
+    it.setSelected(True)
+    g.reordered.emit()
+    assert _page_labels(w) == ["ទំព័រ 4", "ទំព័រ 1", "ទំព័រ 2", "ទំព័រ 3"]
+    assert w.organizer.selected() == [0]
+    monkeypatch.setattr(A.QMessageBox, "question", lambda *a, **k: A.QMessageBox.Yes)
+    QTest.keyClick(g, Qt.Key_Delete)
+    assert _page_labels(w) == ["ទំព័រ 1", "ទំព័រ 2", "ទំព័រ 3"] and g.count() == 3
+    w.undo()
+    assert g.count() == 4
+    w.organizer.grid.open_page.emit(2)                   # double-click a page: back to it
+    assert not w._organizing() and w.page_no == 2

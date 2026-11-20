@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import itertools
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 from pathlib import Path
 
@@ -23,6 +23,7 @@ import pymupdf
 import uharfbuzz as hb
 
 from .legacy import legacy_family, to_unicode
+from .styles import is_bold_name, is_italic_name
 
 FONT_DIR = Path(__file__).parent / "fonts"
 
@@ -655,11 +656,33 @@ class MappedDecoder:
         # blank glyphs (space / ZWSP) can't be matched by outline; when the PDF
         # kept the font's own glyph IDs, keep theirs too (drawn glyphs that
         # didn't match stay unmapped: their outline says they're different)
+        ref = _ref_font(self.path)
+        n = ref.face.glyph_count
         if self.same_ids:
-            n = _ref_font(self.path).face.glyph_count
             self.mapping.update({g: (g,) for g in new
                                  if g not in self.mapping and g < n and not _outlines(self.emb, g)})
+        else:
+            # another version of the font, with glyphs inserted or removed
+            # (Google's Siemreap vs the one Chrome embedded): a blank glyph
+            # (the invisible part of a mark pair) takes the shift its drawn
+            # neighbours have, if the reference glyph there is blank too
+            for g in new:
+                if g in self.mapping or _outlines(self.emb, g):
+                    continue
+                d = self._shift_near(g)
+                if d is not None and 0 <= g + d < n and not _outlines(ref, g + d) \
+                        and ref.get_glyph_h_advance(g + d) * self.emb.face.upem \
+                        == self.emb.get_glyph_h_advance(g) * ref.face.upem:
+                    self.mapping[g] = (g + d,)
         return True
+
+    def _shift_near(self, g: int, reach: int = 24) -> int | None:
+        """The glyph-ID shift of the nearest uniquely matched glyphs below and
+        above g, when they agree (or only one side is known)."""
+        below = [(g - x, m[0] - x) for x, m in self.mapping.items() if len(m) == 1 and 0 < g - x <= reach]
+        above = [(x - g, m[0] - x) for x, m in self.mapping.items() if len(m) == 1 and 0 < x - g <= reach]
+        shifts = [min(side)[1] for side in (below, above) if side]
+        return shifts[0] if shifts and all(s == shifts[0] for s in shifts) else None
 
     def _with_variants(self, cands: tuple[int, ...]) -> tuple[int, ...]:
         """Add, as last resorts, glyphs that are the same mark at another
@@ -779,8 +802,10 @@ def page_decoders(page: pymupdf.Page) -> dict[str, MappedDecoder]:
     refs = reference_fonts()
     gids_by_key: dict[str, set[int]] = {}
     for sp in page.get_texttrace():
+        # (Chrome and Skia write one span per cluster: a ligature such as ណា
+        # may be a span of its own whose only character is U+FFFD)
         if any(0x1780 <= c[0] <= 0x17FF for c in sp["chars"]) or any(
-                0x0180 <= c[0] <= 0x024F or 0xE000 <= c[0] <= 0xF8FF for c in sp["chars"]):
+                0x0180 <= c[0] <= 0x024F or 0xE000 <= c[0] <= 0xF8FF or c[0] == 0xFFFD for c in sp["chars"]):
             gids_by_key.setdefault(_norm(sp["font"]), set()).update(c[1] for c in sp["chars"] if c[1] > 0)
     out: dict[str, MappedDecoder] = {}
     fonts = page.get_fonts(full=True)
@@ -828,6 +853,8 @@ class FoundLine:
     approx: bool = False  # best-effort repair (no matching font): please check
     legacy: bool = False  # converted from a Limon (pre-Unicode) font
     trailing_space: bool = False  # the PDF's text ended with a space
+    runs: list = field(default_factory=list)    # styled runs of `text` (empty = one style)
+    shapes: list = field(default_factory=list)  # rects of letters drawn as shapes
 
 
 def _decode_tokens(tokens: list[tuple[int, str, "MappedDecoder | None"]]) -> tuple[str, float]:
@@ -1108,14 +1135,39 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = (),
     """
     rules = rules if rules is not None else page_rules(page)
     decs = page_decoders(page)
-    glyphs = []  # (x, y, bbox, gid, text, size, font, color, decoder)
+    glyphs = []  # (x, y, bbox, gid, text, size, font, color, decoder, (bold, italic, shape rect))
     seen: set[tuple] = set()  # Word draws bold text twice (fill, then outline) in the same place
+    shapes = None
     for sp in page.get_texttrace():
-        if sp["font"] in skip_fonts or sp.get("type") == 3:
+        if sp["font"] in skip_fonts:
             continue
+        hidden = sp.get("type") == 3 or sp.get("opacity", 1) == 0
+        if hidden and shapes is None:
+            shapes = _text_shapes(page)
+        if sp.get("type") == 3 and not shapes:
+            continue  # an OCR layer or other hidden text
         dec = decs.get(_norm(sp["font"]))
         col = tuple(sp["color"])[:3] if len(sp["color"]) >= 3 else (sp["color"][0],) * 3
-        for c in sp["chars"]:
+        bold = bool(sp.get("flags", 0) & 16) or is_bold_name(sp["font"])
+        italic = bool(sp.get("flags", 0) & 2) or is_italic_name(sp["font"])
+        span_shapes: list = [None] * len(sp["chars"])
+        if hidden:
+            # invisible text over vector shapes: a browser drew the letters as
+            # shapes (its synthetic bold) and laid searchable text on top
+            for i, c in enumerate(sp["chars"]):
+                cx, cy = (c[3][0] + c[3][2]) / 2, (c[3][1] + c[3][3]) / 2
+                span_shapes[i] = next((sh for sh in shapes or () if sh[0].x0 <= cx <= sh[0].x1
+                                       and sh[0].y0 <= cy <= sh[0].y1 and sh[0].height <= 1.6 * sp["size"]), None)
+            # a mark whose box lies off its letter's shape is still part of it
+            found = [i for i, sh in enumerate(span_shapes) if sh is not None]
+            if found:
+                span_shapes = [sh if sh is not None else span_shapes[min(found, key=lambda j: abs(j - i))]
+                               for i, sh in enumerate(span_shapes)]
+        for c, shape in zip(sp["chars"], span_shapes):
+            if hidden and shape is None and sp.get("type") == 3:
+                continue
+            style = (bold or shape is not None, italic, shape[0] if shape is not None else None)
+            gcol = shape[1] if shape is not None else col
             uni = chr(c[0]) if c[0] > 0 else ""
             if uni == " " and dec is not None and c[1] >= 0 and _inked(dec.emb, c[1]):
                 # Word maps some letters (ណ in Khmer OS) to " " in the text layer;
@@ -1129,7 +1181,7 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = (),
             if key in seen:
                 continue
             seen.add(key)
-            glyphs.append((c[2][0], c[2][1], c[3], c[1], uni, sp["size"], sp["font"], col, dec))
+            glyphs.append((c[2][0], c[2][1], c[3], c[1], uni, sp["size"], sp["font"], gcol, dec, style))
     if not glyphs:
         return []
 
@@ -1147,7 +1199,7 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = (),
     segments: list[dict] = []
     open_seg: dict[int, dict] = {}
     for g in glyphs:
-        x, y, bbox, gid, uni, size, font, col, dec = g
+        x, y, bbox, gid, uni, size, font, col, dec, _style = g
         bi = min(range(len(baselines)), key=lambda i: abs(baselines[i] - y))
         if abs(baselines[bi] - y) > 1.2 * size:
             continue
@@ -1199,12 +1251,90 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = (),
                 text, approx = repaired, True
         rect = pymupdf.Rect(seg["x0"], min(g[2][1] for g in gl), seg["x1"], max(g[2][3] for g in gl))
         bases = [g for g in gl if not _is_mark(ord(g[4][0]) if g[4] else 0, g[2], g[5])] or gl
-        main = max(set((g[5], g[6], g[7]) for g in bases), key=lambda k: sum(1 for g in bases if (g[5], g[6], g[7]) == k))
+        # the line's font is its regular (unstyled) text's, when it has some
+        plain_bases = [g for g in bases if not g[9][0] and not g[9][1]] or bases
+        main = max(set((g[5], g[6], g[7]) for g in plain_bases),
+                   key=lambda k: sum(1 for g in plain_bases if (g[5], g[6], g[7]) == k))
+        runs = _line_runs(gl, text, main, legacy) if not approx else []
+        shape_rects = list({id(g[9][2]): g[9][2] for g in gl if g[9][2] is not None}.values())
         out.append(FoundLine(rect=rect, baseline=seg["baseline"], size=round(main[0] * 2) / 2,
                              font=main[1], color=main[2], original=original, text=text,
                              recovered=text != original and not approx, approx=approx,
-                             legacy=legacy, trailing_space=raw != raw.rstrip()))
+                             legacy=legacy, trailing_space=raw != raw.rstrip(),
+                             runs=runs, shapes=shape_rects))
     return out
+
+
+def _text_shapes(page: pymupdf.Page) -> list[tuple[pymupdf.Rect, tuple[float, float, float]]]:
+    """Filled vector shapes that may be letters (not rectangles or lines):
+    their area and fill colour."""
+    out = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return out
+    for d in drawings:
+        if d.get("type") not in ("f", "fs") or not d.get("fill"):
+            continue
+        r = d["rect"]
+        if r.height > 60 or r.height < 0.3:
+            continue  # (table cells are told apart by height, against the text's size)
+        out.append((pymupdf.Rect(r), tuple(d["fill"])[:3]))
+    return out
+
+
+def _line_runs(gl: list, text: str, main: tuple, legacy: bool) -> list:
+    """The line's text cut into styled runs - bold, italic, another font or
+    colour - each decoded separately (styles change between clusters). Empty
+    when the whole line is one style, or the pieces don't add up to `text`."""
+    from .styles import Style, merge
+    _b = is_bold_name
+    if legacy:
+        return []
+
+    def own_key(g):
+        bold, italic, _shape = g[9]
+        fam = "" if _norm(g[6]) == _norm(main[1]) else g[6]
+        col = None if sum(abs(a - b) for a, b in zip(g[7], main[2])) < 0.15 else tuple(round(v, 3) for v in g[7])
+        return (fam, bold and not _b(main[1]), italic, col)
+    keys, prev = [], None
+    for g in gl:
+        k = own_key(g)
+        # a mark (់ ិ ...) or word break belongs to the letter before it
+        # (not េ ែ ៃ: drawn before their consonant, they belong to the letter after)
+        c0 = g[4][:1]
+        if prev is not None and (not g[4].strip() and g[4] != " " or c0 == "\u17d2"
+                                 or KHMER_MARK.match(c0 or "x") and not "\u17c1" <= c0 <= "\u17c3"):
+            k = prev
+        keys.append(k)
+        prev = k
+    groups = [(k, [g for _, g in grp]) for k, grp in itertools.groupby(zip(keys, gl), key=lambda kg: kg[0])]
+    if len(groups) == 1:
+        fam, bold, italic, col = groups[0][0]
+        return [(text, Style("", bold, italic, col))] if bold or italic else []
+    # a Latin word set in another font (Roboto for TOYOTA) is not a style:
+    # only bold, italic and colour changes, and Khmer in another font, count
+    def matters(k, grp):
+        fam, bold, italic, col = k
+        return bold or italic or col or (fam and any("\u1780" <= c <= "\u17ff" for g in grp for c in g[4]))
+    if not any(matters(k, grp) for k, grp in groups):
+        return []
+    pieces = []
+    for k, grp in groups:
+        if any(g[8] for g in grp):
+            cands = [_decode_tokens([(g[3] if g[8] else -1, g[4], g[8]) for g in order])
+                     for order in (_visual_order(grp), grp)]
+            t = min(cands, key=lambda c: c[1])[0]
+        else:
+            t = "".join(g[4] for g in grp).replace("\xa0", " ")
+        fam, bold, italic, col = k if matters(k, grp) else ("", False, False, None)
+        pieces.append((t, Style(fam, bold, italic, col)))
+    # decoding pieces separately may trim their spaces: put them back
+    joined = "".join(t for t, _ in pieces)
+    if re.sub(r"\s", "", joined) != re.sub(r"\s", "", text):
+        return []
+    from .styles import align_runs
+    return align_runs(merge(pieces), text)
 
 
 # --------------------------------------------------------------------------
