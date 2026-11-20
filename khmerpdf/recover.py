@@ -36,7 +36,7 @@ SHIFTERS = ["៉", "៊"]           # MUUSIKATOAN, TRIISAP
 COMMON_FINAL = ["ំ", "ះ", "់"]  # NIKAHIT, REAHMUK, BANTOC
 SUBS = ["្" + c for c in CONS]
 SECOND_SUBS = ["្រ", "្វ", "្យ"]  # ្រ ្វ ្យ
-SUB_SIGNS = ["័", "៍", "៌", "៏"]  # signs that also sit on a subscript (សង្ស័យ, ការណ៍ ...)
+SUB_SIGNS = ["័", "៍", "៌", "៏", "ៈ"]  # signs that also follow a subscript (សង្ស័យ, ការណ៍, ស្រៈ ...)
 OTHER = ([chr(c) for c in range(0x17D4, 0x17DB)] + [chr(c) for c in range(0x17E0, 0x17EA)]
          + [" ", "​"])
 KHMER_MARK = re.compile(r"[ា-៓៝]")
@@ -51,7 +51,7 @@ def _norm(name: str) -> str:
 # --------------------------------------------------------------------------
 # Reverse dictionary per reference font
 # --------------------------------------------------------------------------
-CACHE_VERSION = 10  # 9: 0.5.4 packaged without fontTools built morx-shaped tables  # bump when _build changes in a way the tables below don't show
+CACHE_VERSION = 11  # 11: syllables without empty glyphs (0.7.4); 9: 0.5.4 packaged without fontTools built morx-shaped tables  # bump when _build changes in a way the tables below don't show
 
 
 def _cache_dir() -> Path:
@@ -205,6 +205,18 @@ class GlyphDecoder:
                   *(self._shape_with(f, text) for f in self._also)):
             if 0 not in g and g not in self.seq:  # first (= canonical) spelling wins
                 self.seq[g] = text
+            # Some fonts add an empty glyph after a ligature (Battambang Bold:
+            # ភៅ = េ + ភៅ-ligature + an empty 'uni1794.a2'); Word leaves it out
+            inked = tuple(x for x in g if not self._empty(x))
+            if inked and inked != g and 0 not in inked and inked not in self.seq:
+                self.seq[inked] = text
+
+    def _empty(self, g: int) -> bool:
+        """A glyph with no outline (drawn as nothing)."""
+        cache = self.__dict__.setdefault("_empty_cache", {})
+        if g not in cache:
+            cache[g] = not _outlines(self.font, g)
+        return cache[g]
 
     # Fonts with only Apple (morx) shaping tables: Word embeds Khmer OS 6.00
     # that way, having dropped GSUB, but drew the text through the GSUB it
@@ -412,12 +424,25 @@ class GlyphDecoder:
                 i += 1
         return "".join(out), misses
 
+    def _prebase_inside(self, combo: tuple[int, ...]) -> bool:
+        """A pre-base glyph (េ ែ ៃ, pre-base ្រ) after another kind of glyph:
+        it starts the next syllable, so the window spans two (ស្រៈ|ពេ)."""
+        seen_other = False
+        for w in combo:
+            if w in self.prebase:
+                if seen_other:
+                    return True
+            else:
+                seen_other = True
+        return False
+
     def _lookup(self, window: list[tuple[int, ...]], table: dict, ordered: bool) -> str | None:
         if any(not c for c in window):
             return None
         for combo in itertools.islice(itertools.product(*window), 32):
             if not ordered and (combo[-1] in self.prebase
-                                or sum(1 for w in combo if w in self.bases) > 1):
+                                or sum(1 for w in combo if w in self.bases) > 1
+                                or self._prebase_inside(combo)):
                 continue
             t = table.get(combo if ordered else tuple(sorted(combo)))
             if t is not None:
@@ -853,6 +878,7 @@ class FoundLine:
     approx: bool = False  # best-effort repair (no matching font): please check
     legacy: bool = False  # converted from a Limon (pre-Unicode) font
     trailing_space: bool = False  # the PDF's text ended with a space
+    tab: float = 0.0  # a list item's text after its number: where it starts, from rect.x0 (0 = no tab)
     runs: list = field(default_factory=list)    # styled runs of `text` (empty = one style)
     shapes: list = field(default_factory=list)  # rects of letters drawn as shapes
 
@@ -1077,16 +1103,42 @@ def _split_columns(segments: list[dict]) -> list[dict]:
                             ends.append(c)
             if len(starts) >= COLUMN_ROWS and (max(starts) - min(starts) <= 2 or max(ends) - min(ends) <= 2):
                 cuts.append((a + b) / 2)
+        cuts = _keep_list_markers(s, sorted(cuts))
         if not cuts:
             out.append(s)
             continue
-        edges = [-1e9] + sorted(cuts) + [1e9]
+        edges = [-1e9] + cuts + [1e9]
         for lo, hi in zip(edges, edges[1:]):
             gl = [g for g in s["glyphs"] if lo <= (g[2][0] + g[2][2]) / 2 < hi]  # keeps the drawing order
             if gl:
-                out.append({"baseline": s["baseline"], "glyphs": gl,
-                            "x0": min(g[2][0] for g in gl), "x1": max(g[2][2] for g in gl)})
+                piece = {"baseline": s["baseline"], "glyphs": gl,
+                         "x0": min(g[2][0] for g in gl), "x1": max(g[2][2] for g in gl)}
+                if "tab_x" in s and lo <= s["tab_x"] < hi:
+                    piece["tab_x"] = s["tab_x"]
+                out.append(piece)
     return out
+
+
+_LIST_MARKER = re.compile(r"^\s*(?:[0-9០-៩]{1,3}|[a-zA-Zក-អ])[.)]\s*$|^\s*\(?[0-9០-៩a-zA-Z]{1,3}\)\s*$"
+                          r"|^\s*[-•▪◦●○■□➢►✓–]\s*$")
+
+
+def _keep_list_markers(seg: dict, cuts: list[float]) -> list[float]:
+    """No cut right after a list item's number or bullet ('២.' tab 'text'):
+    the number belongs to its text, though a tab lines it up like a column."""
+    keep, lo, text_before = [], -1e9, False
+    for c in cuts:
+        piece = "".join(g[4] for g in sorted(seg["glyphs"], key=lambda g: g[2][0])
+                        if lo <= (g[2][0] + g[2][2]) / 2 < c)
+        if _LIST_MARKER.match(piece) and not text_before and "tab_x" not in seg:
+            # the text after the tab starts here: kept when the line is rewritten
+            seg["tab_x"] = min((g[2][0] for g in seg["glyphs"] if (g[2][0] + g[2][2]) / 2 >= c
+                                and g[4].strip()), default=c)
+            continue
+        keep.append(c)
+        lo = c
+        text_before = text_before or bool(piece.strip())
+    return keep
 
 
 JOIN_GAP_EM = 8.0  # widest justified gap rejoined
@@ -1256,11 +1308,20 @@ def find_lines(page: pymupdf.Page, skip_fonts: tuple[str, ...] = (),
         main = max(set((g[5], g[6], g[7]) for g in plain_bases),
                    key=lambda k: sum(1 for g in plain_bases if (g[5], g[6], g[7]) == k))
         runs = _line_runs(gl, text, main, legacy) if not approx else []
+        recovered = text != original and not approx
+        tab = 0.0
+        if seg.get("tab_x") and seg["tab_x"] > rect.x0:
+            tabbed = re.sub(r"^\s*([0-9០-៩]{1,3}[.)]|[a-zA-Zក-អ][.)]|\(?[0-9០-៩a-zA-Z]{1,3}\)|[-•▪◦●○■□➢►✓–])"
+                            r"[\s\u200b]*", "\\1\t", text, count=1)
+            if tabbed != text:
+                from .styles import align_runs
+                text, tab = tabbed, seg["tab_x"] - rect.x0
+                runs = align_runs(runs, text) if runs else runs
         shape_rects = list({id(g[9][2]): g[9][2] for g in gl if g[9][2] is not None}.values())
         out.append(FoundLine(rect=rect, baseline=seg["baseline"], size=round(main[0] * 2) / 2,
                              font=main[1], color=main[2], original=original, text=text,
-                             recovered=text != original and not approx, approx=approx,
-                             legacy=legacy, trailing_space=raw != raw.rstrip(),
+                             recovered=recovered, approx=approx,
+                             legacy=legacy, trailing_space=raw != raw.rstrip(), tab=tab,
                              runs=runs, shapes=shape_rects))
     return out
 

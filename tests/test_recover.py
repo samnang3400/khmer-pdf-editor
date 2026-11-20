@@ -333,3 +333,47 @@ def test_recovery_needs_no_library_the_app_does_not_ship(tmp_path):
     assert out.returncode == 0, out.stderr
     for want in ("ក្រោយពេលរៀនចប់សិស្សនឹងមាន", "ត្រឹមត្រូវ", "សៀវភៅ", "ដែលទាក់ទងនឹងមេរៀននេះ"):
         assert want in out.stdout, want
+
+
+# ---- 0.7.4: Battambang Bold headings, ស្រៈ, numbered list items with tabs ----------
+def test_syllables_are_known_without_a_fonts_empty_glyphs():
+    from khmerpdf.engine import FONT_DIR
+    from khmerpdf.recover import decoder
+    d = decoder(str(FONT_DIR / "reference" / "Battambang-Bold.ttf"))
+    full = d._shape("ភៅ")                       # េ + the ភៅ ligature + an empty glyph
+    inked = tuple(g for g in full if not d._empty(g))
+    assert len(inked) < len(full) and d.seq.get(inked) == "ភៅ"   # Word leaves the empty glyph out
+
+
+def test_a_sign_after_a_subscript_stays_in_its_syllable():
+    from khmerpdf.engine import FONT_DIR
+    from khmerpdf.recover import decoder
+    d = decoder(str(FONT_DIR / "khmeros" / "KhmerOSbattambang.ttf"))
+    glyphs = list(d._shape("ស្រៈ")) + list(d._shape("ពេញ"))
+    assert d.decode([(g, "") for g in glyphs]) == "ស្រៈពេញ"
+
+
+def test_a_numbered_item_keeps_its_number_and_tab():
+    import pymupdf
+    from khmerpdf import engine as E
+    doc = pymupdf.open()
+    page = doc.new_page()
+    rows = [("១.", "ព្យញ្ជនៈ", "១០ មេរៀន"), ("២.", "សញ្ញា", "៥ មេរៀន"), ("៣.", "ប្រកប", "១៤ មេរៀន")]
+    for i, (n, t, c) in enumerate(rows):  # number, tab, text, tab, count: like Word's tab stops
+        y = 100 + 20 * i
+        for x, s in ((80, n), (116, t), (260, c)):
+            page.insert_text((x, y), s, fontname="kh", fontfile=str(E.FONT_DIR / "khmeros" / "KhmerOS.ttf"),
+                             fontsize=11)
+    lines = sorted(E.text_lines(page), key=lambda ln: (ln.baseline, ln.rect.x0))
+    first = [ln for ln in lines if ln.text.startswith("២")]
+    assert len(first) == 1 and first[0].text.startswith("២.\tសញ្ញា"), [ln.text for ln in lines]
+    assert abs(first[0].rect.x0 + first[0].tab - 116) < 1.5
+    para = next(p for p in E.paragraphs(E.text_lines(page), page) if p.text.startswith("២."))
+    E.edit_text(page, para, para.text.replace("សញ្ញា", "សញ្ញាថ្មី"))
+    (new,) = [ln for ln in E.text_lines(page) if ln.text.startswith("២.")]
+    assert new.text == "២.\tសញ្ញាថ្មី" and abs(new.rect.x0 - 80) < 1.5
+    assert abs(new.rect.x0 + new.tab - 116) < 1.5           # the text still starts at the tab
+    pix = page.get_pixmap(dpi=144, clip=pymupdf.Rect(97, new.baseline - 9, 114, new.baseline + 2))
+    assert min(pix.samples) > 200                           # drawn there too: blank across the tab
+    pix = page.get_pixmap(dpi=144, clip=pymupdf.Rect(116, new.baseline - 9, 140, new.baseline + 2))
+    assert min(pix.samples) < 100                           # ...and the text right after it
