@@ -450,11 +450,27 @@ def _fit_plan(glyphs: list[Glyph], text: str, scale: float, natural: float,
     return sx, per_space
 
 
+TAB_STOP = 36.0  # pt: Word's default tab stops, for tabs past the line's own
+
+
+def _place_tabs(glyphs: list, text: str, scale: float, tab: float) -> None:
+    """Widen each tab glyph so the text after it starts at `tab` (pt from the
+    line's start: a list item's number, then its text) or, past that, at the
+    next multiple of TAB_STOP."""
+    pen = 0.0
+    for g in glyphs:
+        if 0 <= g.cluster < len(text) and text[g.cluster] == "\t":
+            stop = tab if tab > pen + 0.5 else (pen // TAB_STOP + 1) * TAB_STOP
+            g.x_advance = (stop - pen) / scale
+            g.x_offset = 0
+        pen += g.x_advance * scale
+
+
 def _write_line(page: pymupdf.Page, font: KhmerFont, text: str, x: float, baseline: float,
                 size: float, color: tuple[float, float, float], to_pdf: pymupdf.Matrix,
                 fit_width: float | None = None, visible: bool = True,
                 meta: dict[str, str] | None = None, justify: bool = False,
-                runs: list[Run] | None = None) -> pymupdf.Rect:
+                runs: list[Run] | None = None, tab: float = 0.0) -> pymupdf.Rect:
     """Write one shaped line as its own Form XObject. (x, baseline) are MuPDF
     (top-left origin) coordinates on the unrotated page. With `fit_width`,
     the line is stretched/squeezed to that width (see _fit_plan).
@@ -487,6 +503,10 @@ def _write_line(page: pymupdf.Page, font: KhmerFont, text: str, x: float, baseli
                 glyphs.append(Glyph(g.gid, g.cluster + pos, g.x_advance * k, g.x_offset * k, g.y_offset * k))
                 drawn.append((f, fake, st.italic, st.color))
             pos += len(t)
+    if "\t" in text:
+        _place_tabs(glyphs, text, scale, tab)
+        fit_width, justify = None, False  # stretching would move the tab
+        meta = dict(meta or {}, KhmerPDFTab=f"{tab:.2f}") if tab else meta
     natural = sum(g.x_advance for g in glyphs) * scale
     sx, per_space = _fit_plan(glyphs, text, scale, natural, fit_width, justify)
 
@@ -495,7 +515,8 @@ def _write_line(page: pymupdf.Page, font: KhmerFont, text: str, x: float, baseli
     cur_color = None
     for i, g in enumerate(glyphs):
         f, fake, italic, col = drawn[i]
-        glyph = _glyph_xobject(doc, f, g.gid, fake) if visible else None
+        is_tab = 0 <= g.cluster < len(text) and text[g.cluster] == "\t"
+        glyph = _glyph_xobject(doc, f, g.gid, fake) if visible and not is_tab else None
         if glyph:
             name, gx = glyph
             glyph_res[name] = gx
@@ -516,7 +537,7 @@ def _write_line(page: pymupdf.Page, font: KhmerFont, text: str, x: float, baseli
     #    spans the shaped width. Per-cluster runs line up highlights more
     #    precisely, but PDFium (Chrome/Edge) drops some single-character runs;
     #    a single run per line is the structure every viewer handles.
-    chars = [c for c in text if c not in ZERO_WIDTH and ord(c) <= 0xFFFF]
+    chars = [" " if c == "\t" else c for c in text if c not in ZERO_WIDTH and ord(c) <= 0xFFFF]
     if chars and width > 0:
         p = pymupdf.Point(x, baseline) * to_pdf
         tz = width / (len(chars) * TEXT_DW / 1000 * size) * 100
@@ -557,7 +578,8 @@ def insert_khmer_text(page: pymupdf.Page, rect: pymupdf.Rect, text: str,
                       fit_width: float | None = None,
                       line_step: float | None = None, justify: bool = False,
                       visible: bool = True, meta: dict[str, str] | None = None,
-                      runs: list[Run] | None = None, indent: float = 0.0) -> pymupdf.Rect:
+                      runs: list[Run] | None = None, indent: float = 0.0,
+                      tab: float = 0.0) -> pymupdf.Rect:
     """Write shaped, searchable Khmer text into `rect` (page coordinates as
     displayed). Returns the rect covered by the text.
     Wrapped text is one paragraph: its lines remember the whole text, width,
@@ -610,7 +632,7 @@ def insert_khmer_text(page: pymupdf.Page, rect: pymupdf.Rect, text: str,
                 x = rect.x1 - w
             if line.strip(" " + ZERO_WIDTH):
                 used |= _write_line(page, font, line, x, y, size, color, to_pdf, target, visible, meta, stretch,
-                                    line_runs)
+                                    line_runs, tab)
             y += step
     finally:
         if rotation:
@@ -637,6 +659,7 @@ class TextLine:
     ocr: bool = False        # recognised by OCR (scan): may contain mistakes
     legacy: bool = False     # converted from a legacy (Limon) font encoding
     trailing_space: bool = False  # the line ended with a space (joins paragraphs)
+    tab: float = 0.0         # where the text after a tab ("២.⇥text") starts, from the line's left
     block: str = ""          # paragraph id of lines written together by this app
     block_text: str = ""     # ...that paragraph's whole text, width, spacing, justification
     block_width: float = 0.0
@@ -676,6 +699,9 @@ def _own_lines(page: pymupdf.Page) -> list[TextLine]:
                       font=g("KhmerPDFFont"), color=c,
                       baseline=float(g("KhmerPDFBaseline")), garbled=False, xref=xref,
                       ocr=g("KhmerPDFOCR") == "true")
+        tab = g("KhmerPDFTab")
+        if tab and tab != "null":
+            ln.tab = float(tab)
         runs = g("KhmerPDFRuns")
         if runs and runs != "null":
             ln.runs = ST.from_json(runs, ln.text)
@@ -710,7 +736,7 @@ def text_lines(page: pymupdf.Page, rules=None) -> list[TextLine]:
                               baseline=f.baseline,
                               garbled=not (f.recovered or f.approx) and looks_broken(f.text),
                               original=f.original, recovered=f.recovered, approx=f.approx,
-                              legacy=f.legacy, trailing_space=f.trailing_space,
+                              legacy=f.legacy, trailing_space=f.trailing_space, tab=f.tab,
                               runs=f.runs, shapes=f.shapes))
     return own + found
 
@@ -785,7 +811,7 @@ def _draw_line(page: pymupdf.Page, line: TextLine, new_text: str, font: KhmerFon
         runs = ST.align_runs(line.runs, new_text)
     return insert_khmer_text(page, target, new_text, font=font, size=size or line.size,
                              color=color or line.color, wrap_text=False, baseline=line.baseline + dy,
-                             fit_width=line.rect.width if fit else None, runs=runs)
+                             fit_width=line.rect.width if fit else None, runs=runs, tab=line.tab)
 
 
 def search(page: pymupdf.Page, query: str) -> list[pymupdf.Rect]:
@@ -1032,13 +1058,14 @@ def draw_paragraph(page: pymupdf.Page, para: Paragraph, text: str, font: KhmerFo
         target = pymupdf.Rect(x, first.rect.y0 + dy, page.rect.x1 - 18, first.rect.y1 + dy)
         return insert_khmer_text(page, target, text, font=font, size=size, color=color or first.color,
                                  wrap_text=False, baseline=baseline,
-                                 fit_width=first.rect.width if size == first.size else None, runs=runs)
+                                 fit_width=first.rect.width if size == first.size else None, runs=runs,
+                                 tab=first.tab)
     w = width if width is not None else para.width * scale
     step = para.step * size / first.size if para.step else None  # spacing follows the font size
     target = pymupdf.Rect(x, first.rect.y0 + dy, x + max(w, size), page.rect.y1)
     return insert_khmer_text(page, target, text, font=font, size=size, color=color or first.color,
                              baseline=baseline, line_step=step, justify=para.justify, runs=runs,
-                             indent=para.indent * scale)
+                             indent=para.indent * scale, tab=first.tab * scale)
 
 
 # --------------------------------------------------------------------------

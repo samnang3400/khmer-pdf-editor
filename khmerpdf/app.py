@@ -38,6 +38,25 @@ from .engine import (Paragraph, Picture, TextLine, add_ocr_layer, bundled_fonts,
                      text_lines, write_paragraph)
 
 APP_NAME = "KhmerPDF Editor"
+
+
+def _luminance(c: QColor) -> float:
+    def ch(v: float) -> float:
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    return 0.2126 * ch(c.redF()) + 0.7152 * ch(c.greenF()) + 0.0722 * ch(c.blueF())
+
+
+def readable_background(paper: QColor, text: QColor) -> QColor:
+    """The edit box's background: the colour behind the text on the page, so
+    it looks as it does there - unless the text would be hard to read on it
+    (white text on white), then white or dark, whichever suits the text."""
+    def contrast(a: QColor, b: QColor) -> float:
+        la, lb = sorted((_luminance(a), _luminance(b)), reverse=True)
+        return (la + 0.05) / (lb + 0.05)
+    if contrast(paper, text) >= 3.0:
+        return paper
+    white, dark = QColor("white"), QColor("#2b2b2b")
+    return white if contrast(white, text) >= contrast(dark, text) else dark
 SCREEN_DPI = 96
 UNDO_LIMIT = 30
 ZWSP = "​"
@@ -113,12 +132,25 @@ class Fonts:
     def qfont(self, name: str, px: float) -> QFont:
         f = QFont(self.families.get(name, "Sans Serif"))
         f.setPixelSize(max(round(px), 6))
+        _face(None, f, name)
         return f
 
 
 # --------------------------------------------------------------------------
 # In-place text editor (sits on the page, over the text being edited)
 # --------------------------------------------------------------------------
+def _face(fmt: QTextCharFormat | None, f: QFont | None, name: str) -> None:
+    """Show a bold font file (Battambang Bold...) in its bold face: it shares
+    its family name with the regular one. (The weight stays 'normal': the
+    text is in that font, not made bold on top of it.)"""
+    from .styles import is_bold_name
+    style = "Bold" if is_bold_name(name or "") else ""
+    if f is not None:
+        f.setStyleName(style)
+    if fmt is not None:
+        fmt.setProperty(QTextFormat.FontStyleName, style)
+
+
 FONT_NAME = QTextFormat.UserProperty + 1  # the app's font name on each piece of text (Qt family
                                           # names are shared: Battambang Regular/Bold, Khmer OS/KunKhmer...)
 
@@ -193,6 +225,7 @@ class InlineEditor(QTextEdit):
             f.setItalic(st.italic)
             fmt.setFont(f)
             fmt.setProperty(FONT_NAME, st.font)
+            _face(fmt, f, st.font)
             if st.color is not None:
                 fmt.setForeground(QColor.fromRgbF(*st.color))
             parts = text.split("\n")
@@ -2765,6 +2798,9 @@ class MainWindow(QMainWindow):
         ed.setPlaceholderText("Type the replacement text…" if garbled else "Type here…")
         if kind == "para" and target.step:
             ed.line_px = target.step * s  # wrapped lines sit as far apart as in the PDF
+        tab = target.tab if kind == "edit" else target.first.tab if kind == "para" else 0.0
+        if tab:
+            ed.setTabStopDistance(max(tab * s, 8.0))  # a list item's text after its number, where the PDF has it
         ed.commit.connect(lambda: self._close_inline(save=True))
         ed.cancel.connect(lambda: self._close_inline(save=False))
         ed.style_toggled.connect(self._sync_style_buttons)
@@ -2773,7 +2809,9 @@ class MainWindow(QMainWindow):
         grip = EditorGrip(self.canvas, ed)
         self.inline = dict(editor=ed, grip=grip, kind=kind, line=target if kind == "edit" else None,
                            para=target if kind == "para" else None, field=target if kind == "field" else None,
-                           rect=pymupdf.Rect(rect), orig_size=size)
+                           rect=pymupdf.Rect(rect), orig_size=size,
+                           paper=self._paper_at(rect, (QColor(color).redF(), QColor(color).greenF(),
+                                                       QColor(color).blueF())))
         self._style_inline()
         base = QColor(color)
         resolved = [(t, Style((self._find_font(st.font) if st.font else None) or font, st.bold, st.italic,
@@ -2793,6 +2831,30 @@ class MainWindow(QMainWindow):
         ed.moveCursor(ed.textCursor().MoveOperation.End)
         self.insert_zwsp_act.setEnabled(True)
 
+    def _paper_at(self, rect: pymupdf.Rect, ink: tuple | None = None) -> QColor:
+        """The page's colour behind the text being edited (a coloured cell, a
+        highlight): the commonest colour in its box that isn't the text's."""
+        from collections import Counter
+        try:
+            page = self.doc[self.page_no]
+            r = pymupdf.Rect(rect)
+            r = r * page.derotation_matrix & page.cropbox if page.rotation else r & page.rect  # (clip: unrotated)
+            if r.is_empty:
+                return QColor("white")
+            pix = page.get_pixmap(clip=r, dpi=72, alpha=False, colorspace=pymupdf.csRGB)
+            ink = tuple(v * 255 for v in (ink or (0, 0, 0)))
+            count: Counter = Counter()
+            for y in range(pix.height):
+                for x in range(pix.width):
+                    px = pix.pixel(x, y)
+                    if sum(abs(a - b) for a, b in zip(px, ink)) > 120:  # not the letters
+                        count[tuple(v // 8 * 8 + 4 for v in px)] += 1
+            if not count:
+                return QColor("white")
+            return QColor(*count.most_common(1)[0][0])
+        except Exception:
+            return QColor("white")
+
     def _family_of(self, name: str) -> str:
         """Qt font family for a font name (a PDF's or the app's)."""
         found = name if name in self.fonts.families else (self._find_font(name) if name else None)
@@ -2811,6 +2873,7 @@ class MainWindow(QMainWindow):
         if change == "font":
             fmt.setFontFamilies([self.fonts.families.get(self.cur_font, "Sans Serif")])
             fmt.setProperty(FONT_NAME, self.cur_font)
+            _face(fmt, None, self.cur_font)
             ed.restyle(fmt, whole=False)
         elif change == "color":
             fmt.setForeground(self.cur_color)
@@ -2824,7 +2887,8 @@ class MainWindow(QMainWindow):
         target = self.inline.get("line") or self.inline.get("para")
         check = target is not None and (target.needs_check or target.garbled)
         border = self.theme.warning if check else self.theme.accent
-        ed.setStyleSheet(f"QTextEdit {{ color: {self.cur_color.name()}; background: white; "
+        bg = readable_background(self.inline.get("paper") or QColor("white"), self.cur_color)
+        ed.setStyleSheet(f"QTextEdit {{ color: {self.cur_color.name()}; background: {bg.name()}; "
                          f"border: 2px solid {border}; border-radius: 4px; selection-background-color: "
                          f"{self.theme.accent}; selection-color: white; }}")
         ed.fit()

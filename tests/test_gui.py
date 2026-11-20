@@ -702,3 +702,70 @@ def test_text_in_an_unavailable_font_gets_the_default_font_not_the_last_one_pick
     finally:
         w.dirty = False
         w.close()
+
+
+def test_white_text_on_a_coloured_cell_shows_on_that_colour(qapp, tmp_path):
+    from khmerpdf.engine import insert_khmer_text
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.draw_rect(pymupdf.Rect(50, 60, 400, 130), color=None, fill=(0.1, 0.5, 0.2))  # a green cell
+    insert_khmer_text(page, pymupdf.Rect(60, 80, 380, 120), "ក្រុមទី១", size=16, color=(1, 1, 1),
+                      wrap_text=False)
+    insert_khmer_text(page, pymupdf.Rect(60, 300, 380, 340), "ខ្មៅ", size=16, wrap_text=False)
+    fn = tmp_path / "cell.pdf"
+    doc.save(fn)
+    w = A.MainWindow()
+    w.resize(1000, 800)
+    w.show()
+    w.open_file(str(fn))
+    try:
+        w.set_mode("edit")
+        _click_line(w, "ក្រុម")
+        sheet = w.inline["editor"].styleSheet()
+        assert "color: #ffffff" in sheet and "background: #ffffff" not in sheet
+        bg = A.QColor(sheet.split("background: ")[1][:7])
+        assert bg.green() > bg.red() + 40              # the cell's green, as on the page
+        w._close_inline(save=False)
+        _click_line(w, "ខ្មៅ")                           # black text on white paper: as before
+        assert "background: #ffffff" in w.inline["editor"].styleSheet() or \
+            "background: #fcfcfc" in w.inline["editor"].styleSheet()
+        w._close_inline(save=False)
+    finally:
+        w.dirty = False
+        w.close()
+
+
+def test_readable_background_never_matches_the_text():
+    white, black = A.QColor("white"), A.QColor("black")
+    assert A.readable_background(white, white) != white          # white text: not on white
+    assert A.readable_background(A.QColor("#1a7f37"), white).name() == "#1a7f37"  # a dark cell: kept
+    assert A.readable_background(white, black) == white
+
+
+def test_a_bold_font_file_shows_bold_and_saves_without_extra_bold(qapp, tmp_path):
+    from khmerpdf.engine import insert_khmer_text, load_font
+    from khmerpdf.styles import font_path
+    doc = pymupdf.open()
+    insert_khmer_text(doc.new_page(), pymupdf.Rect(60, 80, 500, 120), "ចំណងជើង", size=16, wrap_text=False,
+                      font=load_font(font_path("Battambang Bold")))
+    fn = tmp_path / "bold.pdf"
+    doc.save(fn)
+    w = A.MainWindow()
+    w.resize(1000, 800)
+    w.show()
+    w.open_file(str(fn))
+    try:
+        w.set_mode("edit")
+        _click_line(w, "ចំណង")
+        ed = w.inline["editor"]
+        assert w.font_box.currentText() == "Battambang Bold"
+        assert ed.textCursor().charFormat().property(A.QTextFormat.FontStyleName) == "Bold"
+        assert not w.bold_act.isChecked()            # it's the bold font, not bold on top of it
+        ed.insertPlainText("ថ្មី")
+        w._close_inline(save=True)
+        (ln,) = text_lines(w.doc[0])
+        assert ln.text == "ចំណងជើងថ្មី" and ln.font == "Battambang Bold"
+        assert not any(s.bold for _, s in ln.runs)
+    finally:
+        w.dirty = False
+        w.close()
