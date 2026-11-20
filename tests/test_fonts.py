@@ -40,7 +40,12 @@ def test_each_extra_font_writes_khmer_that_reads_back(path):
 
 
 def test_fonts_in_the_users_own_folder_are_found_whatever_their_names(tmp_path, monkeypatch):
-    own = tmp_path / ".local/share/fonts/Mine"
+    import os
+    if os.name == "nt":  # per-user fonts on Windows
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        own = tmp_path / "Microsoft" / "Windows" / "Fonts" / "Mine"
+    else:
+        own = tmp_path / ".local/share/fonts/Mine"
     own.mkdir(parents=True)
     shutil.copy(E.FONT_DIR / "extra" / "Tlok.ttf", own / "AKbalthom Kbach.ttf")   # no Khmer-like name
     shutil.copy(E.FONT_DIR / "extra" / "OFL.txt", own / "notes.ttf")              # not a font
