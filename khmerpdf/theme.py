@@ -181,6 +181,8 @@ _ICONS = {
     "sign": '<path d="M3.5 20.5h17"/><path d="m15 4 3.5 3.5L9 17H5.5v-3.5z"/>',
     "close": '<path d="M6 6l12 12"/><path d="M18 6 6 18"/>',
     "check": '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
+    "pages": '<rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/>'
+             '<rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/>',
 }
 
 

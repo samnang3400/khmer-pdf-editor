@@ -63,27 +63,26 @@ def slice_runs(runs: list[Run], start: int, end: int) -> list[Run]:
 
 
 def align_runs(runs: list[Run], text: str) -> list[Run]:
-    """Runs re-cut to describe `text`, a slightly different version of their
-    own text (spaces, invisible word breaks or line breaks added or removed):
-    each character of `text` takes the style of the matching character, or of
-    the character before it."""
+    """Runs re-cut to describe `text`, an edited version of their own text:
+    unchanged characters keep their style; typed ones take the style of the
+    character before them (at the very start, of the one after)."""
+    from difflib import SequenceMatcher
     src = runs_text(runs)
     if src == text:
         return merge(runs)
     styles = [s for t, s in runs for _ in t]
     if not styles:
         return [(text, PLAIN)] if text else []
-    out: list[Run] = []
-    i = 0
-    cur = styles[0]
-    for ch in text:
-        j = i
-        while j < len(src) and src[j] != ch and not ch.isspace() and src[j] in " ​\n":
-            j += 1  # skip spaces / word breaks the new text doesn't have
-        if j < len(src) and src[j] == ch:
-            cur, i = styles[j], j + 1
-        out.append((ch, cur))
-    return merge(out)
+    out: list[Style | None] = [None] * len(text)
+    for tag, i1, i2, j1, j2 in SequenceMatcher(None, src, text, autojunk=False).get_opcodes():
+        if tag == "equal":
+            out[j1:j2] = styles[i1:i2]
+    for j in range(len(text)):  # new characters: like the one before them
+        if out[j] is None and j:
+            out[j] = out[j - 1]
+    first = next((s for s in out if s is not None), styles[0])
+    out = [s if s is not None else first for s in out]
+    return merge([(ch, s) for ch, s in zip(text, out)])
 
 
 def line_slices(text: str, lines: list[str]) -> list[tuple[int, int]]:
