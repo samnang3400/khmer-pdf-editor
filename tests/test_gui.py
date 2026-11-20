@@ -633,3 +633,72 @@ def test_organize_pages(pages_win, monkeypatch):
     assert g.count() == 4
     w.organizer.grid.open_page.emit(2)                   # double-click a page: back to it
     assert not w._organizing() and w.page_no == 2
+
+
+# ---- 0.7.3: the font follows the text being edited ------------------------------
+def _select(ed, start, end):
+    from PySide6.QtGui import QTextCursor
+    cur = ed.textCursor()
+    cur.setPosition(start)
+    cur.setPosition(end, QTextCursor.KeepAnchor)
+    ed.setTextCursor(cur)
+
+
+def _fonts(w):
+    return [(t, s.font) for t, s in text_lines(w.doc[0])[0].runs] or [(text_lines(w.doc[0])[0].text, "")]
+
+
+def test_a_font_picked_for_a_selection_changes_only_the_selection(styled_win):
+    w = styled_win
+    w.set_mode("edit")
+    _click_line(w, "ឈ្មោះ")
+    ed = w.inline["editor"]
+    base = w.cur_font
+    _select(ed, len("ឈ្មោះ៖ "), len("ឈ្មោះ៖ សុខ"))
+    w.font_box.setCurrentText("Khmer OS Muol Light")
+    assert w.cur_font == base                       # the rest of the text keeps its font
+    _select(ed, 0, 3)
+    assert w.font_box.currentText() == base          # the list shows the font where the cursor is
+    _select(ed, len("ឈ្មោះ៖ "), len("ឈ្មោះ៖ សុ"))
+    assert w.font_box.currentText() == "Khmer OS Muol Light"
+    w._close_inline(save=True)
+    got = {t: f for t, f in _fonts(w)}
+    assert got.get("សុខ") == "Khmer OS Muol Light"
+    assert all(f != "Khmer OS Muol Light" for t, f in got.items() if t != "សុខ")
+
+
+def test_fonts_that_share_a_family_name_are_kept_apart(styled_win):
+    w = styled_win                                    # written in Battambang Regular
+    w.set_mode("edit")
+    _click_line(w, "ឈ្មោះ")
+    ed = w.inline["editor"]
+    assert w.fonts.families["Battambang Regular"] == w.fonts.families["Battambang Bold"]
+    ed.moveCursor(ed.textCursor().MoveOperation.End)
+    ed.insertPlainText("ក")
+    w._close_inline(save=True)
+    assert all(f in ("", "Battambang Regular") for _, f in _fonts(w))   # not saved as Battambang Bold
+
+
+def test_text_in_an_unavailable_font_gets_the_default_font_not_the_last_one_picked(qapp, tmp_path):
+    from khmerpdf.engine import insert_khmer_text
+    doc = pymupdf.open()
+    page = doc.new_page()
+    insert_khmer_text(page, pymupdf.Rect(60, 80, 500, 120), "ឈ្មោះ", size=16, wrap_text=False)
+    page.insert_text((60, 300), "Hello there", fontname="Courier", fontsize=14)  # a font we don't have
+    fn = tmp_path / "two.pdf"
+    doc.save(fn)
+    w = A.MainWindow()
+    w.resize(1000, 800)
+    w.show()
+    w.open_file(str(fn))
+    try:
+        w.set_mode("edit")
+        _click_line(w, "ឈ្មោះ")
+        w.font_box.setCurrentText("Khmer OS Muol Light")  # all of it: nothing selected
+        w._close_inline(save=True)
+        _click_line(w, "Hello")
+        assert w.cur_font == w.default_font != "Khmer OS Muol Light"
+        assert w.font_box.currentText() == w.default_font
+    finally:
+        w.dirty = False
+        w.close()

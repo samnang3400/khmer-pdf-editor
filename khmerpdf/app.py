@@ -119,6 +119,10 @@ class Fonts:
 # --------------------------------------------------------------------------
 # In-place text editor (sits on the page, over the text being edited)
 # --------------------------------------------------------------------------
+FONT_NAME = QTextFormat.UserProperty + 1  # the app's font name on each piece of text (Qt family
+                                          # names are shared: Battambang Regular/Bold, Khmer OS/KunKhmer...)
+
+
 class InlineEditor(QTextEdit):
     """Enter = save, Shift+Enter = new line, Esc = cancel, Ctrl+B / Ctrl+I =
     bold / italic. Holds styled text: each piece keeps its font, weight,
@@ -176,7 +180,8 @@ class InlineEditor(QTextEdit):
         self.style_toggled.emit()
 
     def set_runs(self, runs: list, family_of, px: float) -> None:
-        """Fill with styled text: runs of (text, Style) with resolved fonts and colours."""
+        """Fill with styled text: runs of (text, Style) with resolved fonts
+        (the app's font names) and colours."""
         self.clear()
         cur = self.textCursor()
         for text, st in runs:
@@ -187,6 +192,7 @@ class InlineEditor(QTextEdit):
             f.setWeight(QFont.Bold if st.bold else QFont.Normal)
             f.setItalic(st.italic)
             fmt.setFont(f)
+            fmt.setProperty(FONT_NAME, st.font)
             if st.color is not None:
                 fmt.setForeground(QColor.fromRgbF(*st.color))
             parts = text.split("\n")
@@ -212,8 +218,10 @@ class InlineEditor(QTextEdit):
                 frag = it.fragment()
                 if frag.isValid():
                     fmt = frag.charFormat()
-                    fams = fmt.fontFamilies() or [fmt.font().family()]
-                    name = name_of(fams[0] if fams else "") or base_font
+                    name = fmt.property(FONT_NAME)
+                    if not name:
+                        fams = fmt.fontFamilies() or [fmt.font().family()]
+                        name = name_of(fams[0] if fams else "") or base_font
                     col = fmt.foreground().color() if fmt.hasProperty(QTextFormat.ForegroundBrush) else base_color
                     out.append((frag.text(), Style("" if name == base_font else name,
                                                    fmt.fontWeight() >= QFont.DemiBold, fmt.fontItalic(),
@@ -222,6 +230,18 @@ class InlineEditor(QTextEdit):
                 it += 1
             block = block.next()
         return merge_runs([(t.replace("\u2029", "\n"), st) for t, st in out])
+
+    def font_at_cursor(self) -> str | None:
+        """The font name of the selected text (or of the letter before the cursor)."""
+        cur = QTextCursor(self.textCursor())
+        if cur.hasSelection():
+            cur.setPosition(cur.selectionStart())
+            cur.movePosition(QTextCursor.NextCharacter)
+        fmt = cur.charFormat() if cur.position() else self.currentCharFormat()
+        if not cur.position() and not self.document().isEmpty():
+            cur.movePosition(QTextCursor.NextCharacter)
+            fmt = cur.charFormat()
+        return fmt.property(FONT_NAME) or None
 
     def restyle(self, change: QTextCharFormat, whole: bool) -> None:
         """Apply a font/colour/size change to the selection, or to all the text."""
@@ -1154,6 +1174,7 @@ class MainWindow(QMainWindow):
         self.redo_stack: list[tuple[bytes, int]] = []
         self.dirty = False
         self.cur_font = "Battambang Regular" if "Battambang Regular" in self.fonts.paths else next(iter(self.fonts.paths))
+        self.default_font = self.cur_font  # for text whose own font isn't available
         self.cur_size = 14.0
         self.cur_color = QColor(0, 0, 0)
         self.search_hits: list[tuple[int, pymupdf.Rect]] = []
@@ -1936,8 +1957,7 @@ class MainWindow(QMainWindow):
 
     def _font_changed(self, name: str):
         if name != "Add font file…":
-            self.cur_font = name
-            self._style_inline("font")
+            self._apply_font(name)
             return
         path, _ = QFileDialog.getOpenFileName(self, "Add a Khmer font", "", "Fonts (*.ttf *.otf)")
         self.font_box.blockSignals(True)
@@ -1951,6 +1971,22 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, APP_NAME, f"Could not load font:\n{exc}")
         self.font_box.setCurrentText(self.cur_font)
         self.font_box.blockSignals(False)
+        self._apply_font(self.cur_font)
+
+    def _apply_font(self, name: str):
+        """A font picked in the toolbar: for the selected text only when text
+        is selected in the edit box (the rest keeps its own font), otherwise
+        for all of it and for what is typed next."""
+        ed = self.inline["editor"] if getattr(self, "inline", None) else None
+        if ed is not None and ed.textCursor().hasSelection() and self.inline["kind"] != "field":
+            base = self.cur_font
+            self.cur_font = name
+            self._style_inline("font")
+            self.cur_font = base  # the text's own font is still the base
+            ed.setFont(self.fonts.qfont(base, self.cur_size * self.canvas.scale))
+            ed.setFocus()
+            return
+        self.cur_font = name
         self._style_inline("font")
 
     HINTS = {"view": "", "select": "Drag to move · handles resize · Delete removes · double-click edits",
@@ -2331,7 +2367,7 @@ class MainWindow(QMainWindow):
         return name
 
     def _font_for(self, pdf_font: str) -> str:
-        return self._find_font(pdf_font) or self.cur_font
+        return self._find_font(pdf_font) or self.default_font
 
     def _selection_changed(self, para):
         self.delete_act.setEnabled(para is not None and self.canvas.mode == "select")
@@ -2684,7 +2720,7 @@ class MainWindow(QMainWindow):
         font = self._find_font(para.first.font)
         self._edit_message(para, font)
         if not font:
-            font = self.cur_font
+            font = self.default_font
             if not para.needs_check:
                 self.statusBar().showMessage(f"The PDF's font “{para.first.font}” isn't available; using {font}. "
                                              "Pick another font in the toolbar if you like.")
@@ -2695,7 +2731,7 @@ class MainWindow(QMainWindow):
         font = self._find_font(line.font)
         self._edit_message(line, font or line.font)
         if not font:
-            font = self.cur_font
+            font = self.default_font
             if line.font and not (line.needs_check or line.garbled or line.legacy):
                 self.statusBar().showMessage(f"The PDF's font “{line.font}” isn't available; using {font}. "
                                              "Pick another font in the toolbar if you like.")
@@ -2733,13 +2769,14 @@ class MainWindow(QMainWindow):
         ed.cancel.connect(lambda: self._close_inline(save=False))
         ed.style_toggled.connect(self._sync_style_buttons)
         ed.cursorPositionChanged.connect(self._sync_style_buttons)
+        ed.selectionChanged.connect(self._sync_style_buttons)
         grip = EditorGrip(self.canvas, ed)
         self.inline = dict(editor=ed, grip=grip, kind=kind, line=target if kind == "edit" else None,
                            para=target if kind == "para" else None, field=target if kind == "field" else None,
                            rect=pymupdf.Rect(rect), orig_size=size)
         self._style_inline()
         base = QColor(color)
-        resolved = [(t, Style(st.font or font, st.bold, st.italic,
+        resolved = [(t, Style((self._find_font(st.font) if st.font else None) or font, st.bold, st.italic,
                               tuple(st.color) if st.color else (base.redF(), base.greenF(), base.blueF())))
                     for t, st in (runs if runs and kind != "field" else [(text, Style())])]
         ed.set_runs(resolved, self._family_of, size * s)
@@ -2758,7 +2795,7 @@ class MainWindow(QMainWindow):
 
     def _family_of(self, name: str) -> str:
         """Qt font family for a font name (a PDF's or the app's)."""
-        found = self._find_font(name) if name else None
+        found = name if name in self.fonts.families else (self._find_font(name) if name else None)
         return self.fonts.families.get(found or self.cur_font, "Sans Serif")
 
     def _style_inline(self, change: str | None = None):
@@ -2773,6 +2810,7 @@ class MainWindow(QMainWindow):
         fmt = QTextCharFormat()
         if change == "font":
             fmt.setFontFamilies([self.fonts.families.get(self.cur_font, "Sans Serif")])
+            fmt.setProperty(FONT_NAME, self.cur_font)
             ed.restyle(fmt, whole=False)
         elif change == "color":
             fmt.setForeground(self.cur_color)
@@ -2809,6 +2847,12 @@ class MainWindow(QMainWindow):
             if cur.hasSelection():  # the selection's style, not the letter before it
                 cur.setPosition(cur.selectionEnd())
             fmt = cur.charFormat() if cur.hasSelection() or cur.position() else ed.currentCharFormat()
+        if on:
+            shown = ed.font_at_cursor() or self.cur_font
+            if shown in self.fonts.paths and self.font_box.currentText() != shown:
+                self.font_box.blockSignals(True)
+                self.font_box.setCurrentText(shown)
+                self.font_box.blockSignals(False)
         for act, val in ((self.bold_act, on and fmt.fontWeight() >= QFont.DemiBold),
                          (self.italic_act, on and fmt.fontItalic())):
             act.blockSignals(True)
