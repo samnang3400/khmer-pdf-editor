@@ -185,10 +185,13 @@ _KHMEROS_NAMES = {
 
 def bundled_fonts() -> dict[str, str]:
     """Display name -> path for fonts shipped with the app (Google Fonts Khmer
-    fonts + the Khmer OS family, which most Khmer Word documents use)."""
+    fonts + the Khmer OS family, which most Khmer Word documents use, + more
+    freely licensed Khmer fonts in fonts/extra)."""
     out = {p.stem.replace("-", " "): str(p) for p in sorted(FONT_DIR.glob("*.ttf"))}
     for p in sorted((FONT_DIR / "khmeros").glob("*.ttf")):
         out[_KHMEROS_NAMES.get(p.stem, p.stem)] = str(p)
+    for p in sorted((FONT_DIR / "extra").glob("*.ttf")):
+        out.setdefault(p.stem.replace("-", " "), str(p))
     return out
 
 
@@ -212,29 +215,35 @@ def match_font(fonts: dict[str, str], pdf_font: str) -> str | None:
 _KHMER_FONT_HINTS = ("khmer", "daunpenh", "moolboran", "battambang", "siemreap", "kantumruy",
                      "hanuman", "moul", "bokor", "dangrek", "koulen", "nokora", "suwannaphum",
                      "taprom", "preahvihear", "angkor", "bayon", "chenla", "odormean", "kdam",
-                     "fasthand", "freehand", "metal", "content", "limon")
+                     "fasthand", "freehand", "metal", "content", "limon", "kh", "nida", "akbalthom",
+                     "busra", "mondulkiri", "ratanakiri")
 
 
 def system_khmer_fonts() -> dict[str, str]:
     """Khmer-capable .ttf/.otf fonts installed on this computer (e.g. Khmer UI,
-    DaunPenh and Khmer OS on Windows). Filenames are pre-filtered by name,
-    then confirmed by checking for a Khmer glyph."""
+    DaunPenh and Khmer OS on Windows). In the system font folders (thousands
+    of files) names are pre-filtered first; the user's own font folders are
+    checked file by file, whatever the names (AKbalthom, NiDA, KHMMOOL...).
+    Each is confirmed by checking for a Khmer glyph."""
     import os
-    dirs = []
+    dirs: list[tuple[Path, bool]] = []  # (folder, filter by name)
     if os.name == "nt":
-        dirs.append(Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts")
-        dirs.append(Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Windows" / "Fonts")
+        dirs.append((Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts", True))
+        if os.environ.get("LOCALAPPDATA"):
+            dirs.append((Path(os.environ["LOCALAPPDATA"]) / "Microsoft" / "Windows" / "Fonts", False))
     else:
-        dirs += [Path("/usr/share/fonts"), Path.home() / ".local/share/fonts", Path.home() / ".fonts"]
+        dirs += [(Path("/usr/share/fonts"), True), (Path("/usr/local/share/fonts"), True),
+                 (Path.home() / ".local/share/fonts", False), (Path.home() / ".fonts", False)]
     found: dict[str, str] = {}
-    for d in dirs:
+    for d, by_name in dirs:
         if not d.is_dir():
             continue
         for p in d.rglob("*"):
-            if p.suffix.lower() not in (".ttf", ".otf") or not any(h in p.name.lower() for h in _KHMER_FONT_HINTS):
+            if p.suffix.lower() not in (".ttf", ".otf") or \
+                    by_name and not any(h in p.name.lower() for h in _KHMER_FONT_HINTS):
                 continue
             try:
-                f = hb.Font(hb.Face(p.read_bytes()))
+                f = hb.Font(hb.Face(hb.Blob.from_file_path(str(p))))
                 if f.get_nominal_glyph(0x1780):
                     found[p.stem.replace("-", " ").replace("_", " ")] = str(p)
             except Exception:
