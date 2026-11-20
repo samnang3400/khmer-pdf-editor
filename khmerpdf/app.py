@@ -13,23 +13,25 @@ import pymupdf
 from PySide6.QtCore import (QEvent, QEventLoop, QObject, QPoint, QPointF, QRect, QRectF, QSettings, QSize, Qt, QTimer,
                             QUrl, Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QColor, QDesktopServices, QFont, QFontDatabase, QFontMetricsF,
-                           QGuiApplication, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QTransform)
+                           QGuiApplication, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QTextBlockFormat,
+                           QTextCharFormat, QTextCursor, QTextFormat, QTransform)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QColorDialog, QComboBox, QDialog,
                                QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-                               QPlainTextEdit, QProgressDialog, QPushButton, QScrollArea, QSizePolicy,
+                               QPlainTextEdit, QProgressDialog, QPushButton, QScrollArea, QSizePolicy, QTextEdit,
                                QSpinBox, QStackedWidget, QStyle, QStyledItemDelegate, QStyleFactory,
                                QTabBar, QToolBar, QToolButton, QVBoxLayout, QWidget)
 
 from . import __version__, ocr, updater
 from . import annots as AN
+from .styles import Style, merge as merge_runs, register as register_font
 from . import forms as F
 from . import pages as P
 from .annots import Annot
 from .recover import page_rules
 from . import theme as T
 from .engine import (Paragraph, Picture, TextLine, add_ocr_layer, bundled_fonts, convert_legacy,
-                     delete_paragraph, delete_picture, edit_text, insert_khmer_text, load_font, match_font,
+                     delete_paragraph, delete_picture, edit_text, insert_khmer_text, load_font, match_font, norm_font_name,
                      move_picture, paragraphs, pictures, replace_picture, search, system_khmer_fonts,
                      text_lines, write_paragraph)
 
@@ -68,6 +70,7 @@ class Fonts:
     def __init__(self):
         self.paths: dict[str, str] = {}
         self.families: dict[str, str] = {}
+        self.added: list[str] = []  # reference fonts found for a PDF since (for the font list)
         for name, path in bundled_fonts().items():
             self.add(name, path)
         for name, path in system_khmer_fonts().items():
@@ -80,7 +83,30 @@ class Fonts:
         fams = QFontDatabase.applicationFontFamilies(fid) if fid >= 0 else []
         self.paths[name] = path
         self.families[name] = fams[0] if fams else "Sans Serif"
+        register_font(name, path)
         return name
+
+    def name_of(self, family: str) -> str | None:
+        """The font name for a Qt font family (the editor's text formats)."""
+        return next((n for n, f in self.families.items() if f == family), None)
+
+    def find(self, pdf_font: str) -> str | None:
+        """The font to edit a PDF's font with: one already offered, else the
+        same font among those kept for reading PDFs (Google's Siemreap,
+        Kantumruy, Moul... in fonts/reference), which is then offered too."""
+        if not pdf_font:
+            return None
+        name = match_font(self.paths, pdf_font)
+        if name:
+            return name
+        from .recover import FONT_DIR as _FD
+        key = norm_font_name(pdf_font)
+        for p in sorted((_FD / "reference").glob("*.ttf")):
+            if norm_font_name(p.name) == key:
+                name = self.add(p.stem.replace("-", " "), str(p))
+                self.added.append(name)
+                return name
+        return None
 
     def qfont(self, name: str, px: float) -> QFont:
         f = QFont(self.families.get(name, "Sans Serif"))
@@ -91,26 +117,32 @@ class Fonts:
 # --------------------------------------------------------------------------
 # In-place text editor (sits on the page, over the text being edited)
 # --------------------------------------------------------------------------
-class InlineEditor(QPlainTextEdit):
-    """Enter = save, Shift+Enter = new line, Esc = cancel."""
+class InlineEditor(QTextEdit):
+    """Enter = save, Shift+Enter = new line, Esc = cancel, Ctrl+B / Ctrl+I =
+    bold / italic. Holds styled text: each piece keeps its font, weight,
+    slant and colour."""
     commit = Signal()
     cancel = Signal()
+    style_toggled = Signal()  # bold/italic changed with the keyboard
 
     def __init__(self, parent: QWidget, wrap_width: float | None):
         super().__init__(parent)
         self.wrap_width = wrap_width  # px; None = single line that grows to the right
         self.min_width = 60.0         # px; at least the width of the text being covered
         self.min_height = 0.0         # px; a form field's editor covers the whole field
+        self.line_px = 0.0            # px; fixed line height (the PDF's line spacing), 0 = the font's
+        self.setAcceptRichText(False)  # pasted text takes the style where it lands
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.setLineWrapMode(QPlainTextEdit.WidgetWidth if wrap_width else QPlainTextEdit.NoWrap)
+        self.setLineWrapMode(QTextEdit.WidgetWidth if wrap_width else QTextEdit.NoWrap)
         self.document().setDocumentMargin(1)
         self.textChanged.connect(self.fit)
 
     def event(self, e):
-        # keep Esc/Enter/Delete for us instead of the window's shortcuts
-        if e.type() == QEvent.ShortcutOverride and e.key() in (Qt.Key_Escape, Qt.Key_Return, Qt.Key_Enter,
-                                                                 Qt.Key_Delete, Qt.Key_Backspace):
+        # keep Esc/Enter/Delete and the style keys for us instead of the window's shortcuts
+        if e.type() == QEvent.ShortcutOverride and (
+                e.key() in (Qt.Key_Escape, Qt.Key_Return, Qt.Key_Enter, Qt.Key_Delete, Qt.Key_Backspace)
+                or e.modifiers() & Qt.ControlModifier and e.key() in (Qt.Key_B, Qt.Key_I)):
             e.accept()
             return True
         return super().event(e)
@@ -122,24 +154,111 @@ class InlineEditor(QPlainTextEdit):
         if e.key() in (Qt.Key_Return, Qt.Key_Enter) and not e.modifiers() & Qt.ShiftModifier:
             self.commit.emit()
             return
+        if e.modifiers() & Qt.ControlModifier and e.key() in (Qt.Key_B, Qt.Key_I):
+            self.toggle("bold" if e.key() == Qt.Key_B else "italic")
+            return
         super().keyPressEvent(e)
+
+    # ---- styles ------------------------------------------------------------
+    def toggle(self, what: str) -> None:
+        """Bold or italic on/off for the selection (or for what is typed next)."""
+        cur = self.textCursor()
+        fmt = cur.charFormat()
+        on = fmt.fontWeight() >= QFont.DemiBold if what == "bold" else fmt.fontItalic()
+        change = QTextCharFormat()
+        if what == "bold":
+            change.setFontWeight(QFont.Normal if on else QFont.Bold)
+        else:
+            change.setFontItalic(not on)
+        self.mergeCurrentCharFormat(change)
+        self.style_toggled.emit()
+
+    def set_runs(self, runs: list, family_of, px: float) -> None:
+        """Fill with styled text: runs of (text, Style) with resolved fonts and colours."""
+        self.clear()
+        cur = self.textCursor()
+        for text, st in runs:
+            fmt = QTextCharFormat()
+            fmt.setFontFamilies([family_of(st.font)])
+            f = QFont(family_of(st.font))
+            f.setPixelSize(max(round(px), 6))
+            f.setWeight(QFont.Bold if st.bold else QFont.Normal)
+            f.setItalic(st.italic)
+            fmt.setFont(f)
+            if st.color is not None:
+                fmt.setForeground(QColor.fromRgbF(*st.color))
+            parts = text.split("\n")
+            for i, part in enumerate(parts):
+                if i:
+                    cur.insertBlock()
+                cur.insertText(part, fmt)
+        self.setTextCursor(cur)
+        self.apply_line_height()
+
+    def runs(self, name_of, base_font: str, base_color: QColor) -> list:
+        """The text as runs of (text, Style); the paragraph's own font and
+        colour are left unnamed (Style.font "" / color None)."""
+        out = []
+        block = self.document().begin()
+        first = True
+        while block.isValid():
+            if not first:
+                out.append(("\n", out[-1][1] if out else Style()))
+            first = False
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid():
+                    fmt = frag.charFormat()
+                    fams = fmt.fontFamilies() or [fmt.font().family()]
+                    name = name_of(fams[0] if fams else "") or base_font
+                    col = fmt.foreground().color() if fmt.hasProperty(QTextFormat.ForegroundBrush) else base_color
+                    out.append((frag.text(), Style("" if name == base_font else name,
+                                                   fmt.fontWeight() >= QFont.DemiBold, fmt.fontItalic(),
+                                                   None if col.name() == base_color.name()
+                                                   else (col.redF(), col.greenF(), col.blueF()))))
+                it += 1
+            block = block.next()
+        return merge_runs([(t.replace("\u2029", "\n"), st) for t, st in out])
+
+    def restyle(self, change: QTextCharFormat, whole: bool) -> None:
+        """Apply a font/colour/size change to the selection, or to all the text."""
+        cur = self.textCursor()
+        if whole or not cur.hasSelection():
+            cur.select(QTextCursor.Document)
+            cur.mergeCharFormat(change)
+            self.mergeCurrentCharFormat(change)
+        else:
+            cur.mergeCharFormat(change)
+        self.apply_line_height()
+
+    def apply_line_height(self) -> None:
+        if not self.line_px:
+            return
+        cur = QTextCursor(self.document())
+        cur.select(QTextCursor.Document)
+        bf = QTextBlockFormat()
+        bf.setLineHeight(self.line_px, QTextBlockFormat.FixedHeight.value
+                         if hasattr(QTextBlockFormat.FixedHeight, "value") else 2)
+        self.blockSignals(True)
+        cur.mergeBlockFormat(bf)
+        self.blockSignals(False)
+        self.fit()
 
     def fit(self):
         """Grow with the text so the editor never shows scrollbars."""
-        fm = QFontMetricsF(self.font())
         pad = 10
+        doc = self.document()
         if self.wrap_width:
-            # QPlainTextEdit's document height is measured in (wrapped) lines,
-            # laid out at the current width: set the width first
+            # the document is laid out at the current width: set the width first
             w = max(self.wrap_width + pad, self.min_width)
             if self.width() != int(w):
                 self.resize(int(w), self.height())
-            n = max(1, int(self.document().size().height()))
-            h = n * fm.lineSpacing() + pad
+            doc.setTextWidth(self.viewport().width())
         else:
-            lines = self.toPlainText().split("\n")
-            w = max(fm.horizontalAdvance(t) for t in lines) + fm.averageCharWidth() * 3 + pad
-            h = len(lines) * fm.lineSpacing() + pad
+            doc.setTextWidth(-1)
+            w = doc.idealWidth() + QFontMetricsF(self.currentFont()).averageCharWidth() * 3 + pad
+        h = doc.size().height() + pad
         self.resize(int(max(w, self.min_width)), int(max(h, self.min_height)))
 
 
@@ -1045,6 +1164,20 @@ class MainWindow(QMainWindow):
         self.color_btn.setCursor(Qt.PointingHandCursor)
         self.color_btn.clicked.connect(self._pick_color)
         fb.addWidget(self.color_btn)
+        self.bold_act = QAction("B", self, checkable=True)
+        self.bold_act.setToolTip("Bold (Ctrl+B while typing)")
+        self.bold_act.triggered.connect(lambda: self._toggle_style("bold"))
+        self.italic_act = QAction("I", self, checkable=True)
+        self.italic_act.setToolTip("Italic (Ctrl+I while typing)")
+        self.italic_act.triggered.connect(lambda: self._toggle_style("italic"))
+        for act, bold in ((self.bold_act, True), (self.italic_act, False)):
+            fb.addAction(act)
+            btn = fb.widgetForAction(act)
+            f = QFont(btn.font())
+            f.setBold(bold)
+            f.setItalic(not bold)
+            btn.setFont(f)
+            act.setEnabled(False)
         fb.addSeparator()
         self.insert_zwsp_act = self._act("Word Break", self.insert_zwsp, "wordbreak", "Ctrl+Shift+Space",
                                          "Insert an invisible Khmer word break (ZWSP) where a line may wrap", fb)
@@ -1534,18 +1667,18 @@ class MainWindow(QMainWindow):
         if c.isValid():
             self.cur_color = c
             self._paint_color_btn()
-            self._style_inline()
+            self._style_inline("color")
         if self.inline:
             self.inline["editor"].setFocus()
 
     def _size_changed(self, v: float):
         self.cur_size = v
-        self._style_inline()
+        self._style_inline("size")
 
     def _font_changed(self, name: str):
         if name != "Add font file…":
             self.cur_font = name
-            self._style_inline()
+            self._style_inline("font")
             return
         path, _ = QFileDialog.getOpenFileName(self, "Add a Khmer font", "", "Fonts (*.ttf *.otf)")
         self.font_box.blockSignals(True)
@@ -1559,7 +1692,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, APP_NAME, f"Could not load font:\n{exc}")
         self.font_box.setCurrentText(self.cur_font)
         self.font_box.blockSignals(False)
-        self._style_inline()
+        self._style_inline("font")
 
     HINTS = {"view": "", "select": "Drag to move · handles resize · Delete removes · double-click edits",
              "edit": "Click text to edit it in place", "add": "Drag a box (or click) and type",
@@ -1915,8 +2048,17 @@ class MainWindow(QMainWindow):
             return "annot", item.rect.x0, item.rect.y0
         return "text", item.x, item.first.baseline
 
+    def _find_font(self, pdf_font: str) -> str | None:
+        """Fonts.find, adding a newly found font to the toolbar's list."""
+        name = self.fonts.find(pdf_font)
+        while self.fonts.added:
+            self.font_box.blockSignals(True)
+            self.font_box.insertItem(self.font_box.count() - 1, self.fonts.added.pop(0))
+            self.font_box.blockSignals(False)
+        return name
+
     def _font_for(self, pdf_font: str) -> str:
-        return match_font(self.fonts.paths, pdf_font) or self.cur_font
+        return self._find_font(pdf_font) or self.cur_font
 
     def _selection_changed(self, para):
         self.delete_act.setEnabled(para is not None and self.canvas.mode == "select")
@@ -1954,7 +2096,7 @@ class MainWindow(QMainWindow):
         first, scale = para.first, kw.get("scale", 1.0)
         self._select_key = ("text", para.x + kw.get("dx", 0.0), first.baseline + kw.get("dy", 0.0))
         self._changed()
-        if not match_font(self.fonts.paths, first.font) and not first.xref:
+        if not self._find_font(first.font) and not first.xref:
             self.statusBar().showMessage(f"The PDF's font “{first.font}” isn't available, so the text was "
                                          f"redrawn in {name}.")
         elif scale != 1.0:
@@ -2230,7 +2372,7 @@ class MainWindow(QMainWindow):
         if len(para.lines) == 1:
             self.edit_line(para.first)
             return
-        font = match_font(self.fonts.paths, para.first.font)
+        font = self._find_font(para.first.font)
         self._edit_message(para, font)
         if not font:
             font = self.cur_font
@@ -2238,20 +2380,20 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"The PDF's font “{para.first.font}” isn't available; using {font}. "
                                              "Pick another font in the toolbar if you like.")
         self._open_inline("para", para, block_rect(para), para.text, font, para.first.size,
-                          QColor.fromRgbF(*para.first.color), wrap=True)
+                          QColor.fromRgbF(*para.first.color), wrap=True, runs=para.runs)
 
     def edit_line(self, line: TextLine):
-        font = match_font(self.fonts.paths, line.font)
+        font = self._find_font(line.font)
         self._edit_message(line, font or line.font)
         if not font:
             font = self.cur_font
             if line.font and not (line.needs_check or line.garbled or line.legacy):
                 self.statusBar().showMessage(f"The PDF's font “{line.font}” isn't available; using {font}. "
                                              "Pick another font in the toolbar if you like.")
-        self._open_inline("edit", line, line.rect, "" if line.garbled else line.text,
-                          font, line.size, QColor.fromRgbF(*line.color), wrap=False)
+        self._open_inline("edit", line, line.rect, "" if line.garbled else line.text, font, line.size,
+                          QColor.fromRgbF(*line.color), wrap=False, runs=[] if line.garbled else line.runs)
 
-    def _open_inline(self, kind, target, rect, text, font, size, color, wrap):
+    def _open_inline(self, kind, target, rect, text, font, size, color, wrap, runs=None):
         self._close_inline(save=True)
         if kind == "edit":
             target = next((ln for ln in self.canvas.lines if ln.rect == target.rect), target)
@@ -2276,15 +2418,23 @@ class MainWindow(QMainWindow):
             ed.min_height = rect.height * s + 10
         garbled = kind == "edit" and target.garbled
         ed.setPlaceholderText("Type the replacement text…" if garbled else "Type here…")
-        ed.setPlainText(text)
+        if kind == "para" and target.step:
+            ed.line_px = target.step * s  # wrapped lines sit as far apart as in the PDF
         ed.commit.connect(lambda: self._close_inline(save=True))
         ed.cancel.connect(lambda: self._close_inline(save=False))
+        ed.style_toggled.connect(self._sync_style_buttons)
+        ed.cursorPositionChanged.connect(self._sync_style_buttons)
         grip = EditorGrip(self.canvas, ed)
         self.inline = dict(editor=ed, grip=grip, kind=kind, line=target if kind == "edit" else None,
                            para=target if kind == "para" else None, field=target if kind == "field" else None,
-                           rect=pymupdf.Rect(rect),
-                           start=(text, font, size, QColor(color).name()))
+                           rect=pymupdf.Rect(rect), orig_size=size)
         self._style_inline()
+        base = QColor(color)
+        resolved = [(t, Style(st.font or font, st.bold, st.italic,
+                              tuple(st.color) if st.color else (base.redF(), base.greenF(), base.blueF())))
+                    for t, st in (runs if runs and kind != "field" else [(text, Style())])]
+        ed.set_runs(resolved, self._family_of, size * s)
+        self.inline["start"] = (text, ed.runs(self.fonts.name_of, font, base), font, size, base.name())
         top = (target.baseline - size * 1.0) * s if kind == "edit" else rect.y0 * s + (5 if kind == "field" else 0)
         ed.move(int(rect.x0 * s) - 5, int(min(top, rect.y0 * s)) - 5)
         self.inline["origin"] = QPoint(ed.pos())
@@ -2297,15 +2447,37 @@ class MainWindow(QMainWindow):
         ed.moveCursor(ed.textCursor().MoveOperation.End)
         self.insert_zwsp_act.setEnabled(True)
 
-    def _style_inline(self):
+    def _family_of(self, name: str) -> str:
+        """Qt font family for a font name (a PDF's or the app's)."""
+        found = self._find_font(name) if name else None
+        return self.fonts.families.get(found or self.cur_font, "Sans Serif")
+
+    def _style_inline(self, change: str | None = None):
+        """Show the toolbar's style in the open editor. `change`: what the
+        user just changed - 'font' and 'color' apply to the selected text
+        (all of it when nothing is selected); 'size' to all of it."""
         if not self.inline:
             return
         ed = self.inline["editor"]
-        ed.setFont(self.fonts.qfont(self.cur_font, self.cur_size * self.canvas.scale))
+        px = self.cur_size * self.canvas.scale
+        ed.setFont(self.fonts.qfont(self.cur_font, px))
+        fmt = QTextCharFormat()
+        if change == "font":
+            fmt.setFontFamilies([self.fonts.families.get(self.cur_font, "Sans Serif")])
+            ed.restyle(fmt, whole=False)
+        elif change == "color":
+            fmt.setForeground(self.cur_color)
+            ed.restyle(fmt, whole=False)
+        elif change == "size":
+            fmt.setProperty(QTextFormat.FontPixelSize, max(round(px), 6))
+            para = self.inline.get("para")
+            if para is not None and para.step:
+                ed.line_px = para.step * self.canvas.scale * self.cur_size / self.inline["orig_size"]
+            ed.restyle(fmt, whole=True)
         target = self.inline.get("line") or self.inline.get("para")
         check = target is not None and (target.needs_check or target.garbled)
         border = self.theme.warning if check else self.theme.accent
-        ed.setStyleSheet(f"QPlainTextEdit {{ color: {self.cur_color.name()}; background: white; "
+        ed.setStyleSheet(f"QTextEdit {{ color: {self.cur_color.name()}; background: white; "
                          f"border: 2px solid {border}; border-radius: 4px; selection-background-color: "
                          f"{self.theme.accent}; selection-color: white; }}")
         ed.fit()
@@ -2314,6 +2486,27 @@ class MainWindow(QMainWindow):
                            f"padding: 2px 8px; border-radius: 4px; }}")
         grip.place()
 
+    def _toggle_style(self, what: str):
+        if self.inline and self.inline["kind"] != "field":
+            self.inline["editor"].toggle(what)
+            self.inline["editor"].setFocus()
+
+    def _sync_style_buttons(self):
+        ed = self.inline["editor"] if self.inline else None
+        on = ed is not None and self.inline["kind"] != "field"
+        fmt = None
+        if on:
+            cur = QTextCursor(ed.textCursor())
+            if cur.hasSelection():  # the selection's style, not the letter before it
+                cur.setPosition(cur.selectionEnd())
+            fmt = cur.charFormat() if cur.hasSelection() or cur.position() else ed.currentCharFormat()
+        for act, val in ((self.bold_act, on and fmt.fontWeight() >= QFont.DemiBold),
+                         (self.italic_act, on and fmt.fontItalic())):
+            act.blockSignals(True)
+            act.setEnabled(on)
+            act.setChecked(bool(val))
+            act.blockSignals(False)
+
     def _close_inline(self, save: bool) -> None:
         """Save (or discard) the open in-place editor, if any."""
         if not getattr(self, "inline", None):
@@ -2321,16 +2514,19 @@ class MainWindow(QMainWindow):
         st, self.inline = self.inline, None
         ed = st["editor"]
         text = ed.toPlainText()
+        runs = ed.runs(self.fonts.name_of, self.cur_font, self.cur_color)
         moved = ed.pos() - st.get("origin", ed.pos())
         dx, dy = moved.x() / self.canvas.scale, moved.y() / self.canvas.scale  # dragged by its grip
         for w in (ed, st["grip"]):
             w.hide()
             w.deleteLater()
         self.insert_zwsp_act.setEnabled(False)
+        self._sync_style_buttons()
         self.canvas.setFocus()
         if not save or not self.doc:
             return
-        unchanged = (text, self.cur_font, self.cur_size, self.cur_color.name()) == st["start"] and not (dx or dy)
+        unchanged = ((text, runs, self.cur_font, self.cur_size, self.cur_color.name()) == st["start"]
+                     and not (dx or dy))
         if st["kind"] == "add" and not text.strip():
             return
         if st["kind"] == "edit" and (unchanged or (st["line"].garbled and not text.strip())):
@@ -2359,13 +2555,14 @@ class MainWindow(QMainWindow):
             if st["kind"] == "add":
                 r = st["rect"]
                 insert_khmer_text(page, pymupdf.Rect(r.x0 + dx, r.y0 + dy, r.x1 + dx, r.y1 + dy), text,
-                                  font=font, size=self.cur_size, color=rgb)
+                                  font=font, size=self.cur_size, color=rgb, runs=runs)
             else:
                 # longer text pushes what's below it down (unless it was dragged elsewhere)
                 _, warning, made_room = edit_text(
                     page, st["line"] if st["kind"] == "edit" else st["para"], text, font=font,
-                    size=self.cur_size, color=rgb, fit=st["start"][1:3] == (self.cur_font, self.cur_size),
-                    dx=dx, dy=dy, font_for=lambda name: load_font(self.fonts.paths[self._font_for(name)]))
+                    size=self.cur_size, color=rgb, fit=st["start"][2:4] == (self.cur_font, self.cur_size),
+                    dx=dx, dy=dy, font_for=lambda name: load_font(self.fonts.paths[self._font_for(name)]),
+                    runs=runs)
         except Exception as exc:
             self._restore(self.undo_stack.pop())
             QMessageBox.critical(self, APP_NAME, f"Could not save the text:\n{exc}")
