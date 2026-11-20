@@ -97,8 +97,11 @@ Lines written by the app also store their own text, font, size and colour, so ed
   the release page instead. Nothing is installed without a matching checksum. Turn the automatic check off
   in the Help menu
 - Bundled fonts: the **Khmer OS** family (System, Battambang, Siemreap, Content, Muol…), Battambang
-  and Moul. Khmer fonts installed on the computer
-  (Khmer UI, DaunPenh, Khmer OS…) are detected automatically, and any .ttf can be added
+  and Moul, plus 36 more freely licensed Khmer fonts: Khmer Busra and Mondulkiri (with bold and italic),
+  Ratanakiri, Oureang, Tlok, Timbre Kampuchea, Sithi Manuss, Khao I Dang, Khmer Pen Teu and Chantrea,
+  Khmer M1/M2/S1–S4, Aphireak and others (licences in `khmerpdf/fonts/extra`). Khmer fonts installed on
+  the computer (Khmer UI, DaunPenh, Khmer OS…) are detected automatically: in the system font folder by
+  name, and every font in the user's own font folder whatever its name. Any .ttf can also be added
 
 ## Development
 
@@ -170,8 +173,8 @@ sudo apt install tesseract-ocr patchelf libxcb-cursor0
 pip install -r requirements-dev.txt
 installer/linux/bundle-tesseract.sh          # optional, for OCR: copies tesseract into build-deps/
 pyinstaller --noconfirm khmerpdf.spec
-installer/linux/build-appimage.sh 0.7.0      # needs appimagetool on PATH (or APPIMAGETOOL=...)
-installer/linux/build-deb.sh 0.7.0
+installer/linux/build-appimage.sh 0.7.1      # needs appimagetool on PATH (or APPIMAGETOOL=...)
+installer/linux/build-deb.sh 0.7.1
 ```
 
 An AppImage only runs on systems with the same or newer glibc as the PC that built it, so build on

@@ -1553,7 +1553,7 @@ class MainWindow(QMainWindow):
                           "shaping, searchable text, recovery of broken Khmer PDFs, legacy font (Limon, ABC) conversion and OCR."
                           "<br><br>Footprints International School<br><br>"
                           "<small>Built with PyMuPDF (AGPL), Qt for Python, HarfBuzz and Tesseract OCR. "
-                          "Fonts: Khmer OS (LGPL), Battambang and Moul (OFL).<br>"
+                          "Fonts: Khmer OS (LGPL), Battambang and Moul (OFL), and more Khmer fonts under the OFL, LGPL and Apache licences.<br>"
                           f"Free software under the GNU AGPL-3.0. Source code: "
                           f"<a href='https://github.com/{updater.REPO}'>github.com/{updater.REPO}</a></small>")
 
